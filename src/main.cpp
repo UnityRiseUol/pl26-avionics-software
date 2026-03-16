@@ -25,6 +25,7 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <INS_Model_C.h>
+#include <cmath>
 
 // --- Definitions ---
 #define BMP_CS 18
@@ -129,6 +130,199 @@ void loggingTask(void *pvParameters);
 void buttonTask(void *pvParameters);
 void webServerTask(void *pvParameters);
 void loraTask(void *pvParameters);
+void flightPhaseTask(void *pvParameters);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flight Phase Detection
+// Ported from State_Prediction.py — no look-ahead, processes one sample at a time.
+//
+// Phase IDs:
+//   0 = IDLE  (pre-launch baseline)
+//   1 = LAUNCH
+//   2 = MOTOR BURNOUT
+//   3 = APOGEE
+//   4 = PARACHUTE DEPLOYED
+//   5 = LANDED
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr const char* const FLIGHT_PHASE_NAMES[] = {
+    "IDLE",
+    "LAUNCH",
+    "MOTOR BURNOUT",
+    "APOGEE",
+    "PARACHUTE DEPLOYED",
+    "LANDED"
+};
+
+class FlightDetector {
+public:
+    static constexpr int BASELINE_N    = 30;
+    static constexpr int CHUTE_BUF_SZ  = 20;
+
+    FlightDetector()
+        : _phase(0), _blAccelSum(0.0f), _blAccelSumSq(0.0f), _blAltSum(0.0f), _blN(0),
+          _baselineDone(false), _blAccelMean(0.0f), _blAccelStd(1.0f), _blAltMean(0.0f),
+          _launchStreak(0), _burnoutStreak(0), _apogeePeak(0.0f), _apogeeStreak(0),
+          _chuteBuf{}, _chuteHead(0), _chuteCount(0), _chuteWarmup(0), _landStreak(0) {
+    }
+
+    void reset() {
+        _phase        = 0;
+        _blAccelSum   = 0.0f; _blAccelSumSq = 0.0f; _blAltSum = 0.0f; _blN = 0;
+        _baselineDone = false;
+        _blAccelMean  = 0.0f; _blAccelStd = 1.0f; _blAltMean = 0.0f;
+        _launchStreak = 0; _burnoutStreak = 0;
+        _apogeePeak   = 0.0f; _apogeeStreak = 0;
+        for (auto& val : _chuteBuf) val = 0.0f;
+        _chuteHead = 0; _chuteCount = 0; _chuteWarmup = 0;
+        _landStreak = 0;
+    }
+
+    // Feed one sample. Returns new phase (0-5) on transition, -1 otherwise.
+    // accel_mag : total acceleration magnitude (m/s²)
+    // alt_ft    : barometric altitude (feet)
+    // accel_baro: d(vertical_speed)/dt (m/s²)
+    int feed(float accel_mag, float alt_ft, float accel_baro) {
+        const int prev = _phase;
+
+        // ── Baseline collection ──────────────────────────────────────────────
+        if (!_baselineDone) {
+            if (_blN >= 3) {
+                const float runningMean = _blAccelSum / static_cast<float>(_blN);
+                if (accel_mag > runningMean * 5.0f) {
+                    // Looks like ignition — finalise without this sample, fall through
+                    _finaliseBaseline();
+                } else {
+                    _accumulate(accel_mag, alt_ft);
+                    if (_blN >= BASELINE_N) _finaliseBaseline();
+                    return -1;
+                }
+            } else {
+                _accumulate(accel_mag, alt_ft);
+                return -1;
+            }
+        }
+
+        // ── State machine ────────────────────────────────────────────────────
+
+        if (_phase == 0) {
+            // IDLE → LAUNCH: accel_mag > baseline + 5σ, sustained 2+ samples
+            const float thresh = _blAccelMean + 5.0f * _blAccelStd;
+            _launchStreak = (accel_mag > thresh) ? (_launchStreak + 1) : 0;
+            if (_launchStreak >= 2) _phase = 1;
+        }
+        else if (_phase == 1) {
+            // LAUNCH → MOTOR BURNOUT: accel_mag back within baseline + 2σ for 5 samples
+            const float thresh = _blAccelMean + 2.0f * _blAccelStd;
+            _burnoutStreak = (accel_mag < thresh) ? (_burnoutStreak + 1) : 0;
+            if (_burnoutStreak >= 5) _phase = 2;
+        }
+        else if (_phase == 2) {
+            // MOTOR BURNOUT → APOGEE: altitude below rolling peak for 8 samples
+            if (alt_ft >= _apogeePeak) { _apogeePeak = alt_ft; _apogeeStreak = 0; }
+            else                       { _apogeeStreak++; }
+            if (_apogeeStreak >= 8) _phase = 3;
+        }
+        else if (_phase == 3) {
+            // APOGEE → PARACHUTE: statistical spike in accel_baro vs recent noise
+            _chuteBuf[_chuteHead] = accel_baro;
+            _chuteHead = (_chuteHead + 1) % CHUTE_BUF_SZ;
+            if (_chuteCount < CHUTE_BUF_SZ) _chuteCount++;
+            _chuteWarmup++;
+
+            if (_chuteWarmup >= 15 && _chuteCount >= 15) {
+                float mean = 0.0f;
+                for (int i = 0; i < _chuteCount; ++i) mean += _chuteBuf[i];
+                mean /= static_cast<float>(_chuteCount);
+                float var = 0.0f;
+                for (int i = 0; i < _chuteCount; ++i) {
+                    const float d = _chuteBuf[i] - mean;
+                    var += d * d;
+                }
+                const float sd = sqrtf(var / static_cast<float>(_chuteCount));
+                const float eff = (sd > 1.0f) ? sd : 1.0f;
+                if (fabsf(accel_baro - mean) > 4.0f * eff) _phase = 4;
+            }
+        }
+        else if (_phase == 4) {
+            // PARACHUTE → LANDED: altitude within 15 ft of ground baseline for 10 samples
+            _landStreak = (fabsf(alt_ft - _blAltMean) < 15.0f) ? (_landStreak + 1) : 0;
+            if (_landStreak >= 10) _phase = 5;
+        }
+        // Phase 5 (LANDED) is terminal
+
+        return (_phase != prev) ? _phase : -1;
+    }
+
+    int phase() const { return _phase; }
+
+private:
+    int   _phase;
+    float _blAccelSum, _blAccelSumSq, _blAltSum;
+    int   _blN;
+    bool  _baselineDone;
+    float _blAccelMean, _blAccelStd, _blAltMean;
+    int   _launchStreak, _burnoutStreak;
+    float _apogeePeak;
+    int   _apogeeStreak;
+    float _chuteBuf[CHUTE_BUF_SZ];
+    int   _chuteHead, _chuteCount, _chuteWarmup;
+    int   _landStreak;
+
+    void _accumulate(float am, float af) {
+        _blAccelSum += am; _blAccelSumSq += am * am; _blAltSum += af; _blN++;
+    }
+    void _finaliseBaseline() {
+        _blAccelMean = _blAccelSum / static_cast<float>(_blN);
+        float var    = (_blAccelSumSq / static_cast<float>(_blN)) - (_blAccelMean * _blAccelMean);
+        if (var < 0.0f) var = 0.0f;
+        const float sd = sqrtf(var);
+        _blAccelStd  = (sd > 0.5f) ? sd : 0.5f;
+        _blAltMean   = _blAltSum / static_cast<float>(_blN);
+        _baselineDone = true;
+    }
+};
+
+void flightPhaseTask(void *pvParameters) {
+    FlightDetector detector;
+    float prevVelMs  = 0.0f;
+    unsigned long prevTimeMs = 0;
+
+    for (;;) {
+        AllSensorData local{};
+        if (xSemaphoreTake(xSensorDataMutex, portMAX_DELAY) == pdTRUE) {
+            memcpy(&local, &sensorData, sizeof(AllSensorData));
+            xSemaphoreGive(xSensorDataMutex);
+        }
+
+        // Total acceleration magnitude: BNO linear accel + gravity vectors
+        const float ax = local.bnoLinearAccX + local.bnoGravityX;
+        const float ay = local.bnoLinearAccY + local.bnoGravityY;
+        const float az = local.bnoLinearAccZ + local.bnoGravityZ;
+        const float accelMag = sqrtf(ax*ax + ay*ay + az*az);
+
+        // Altitude in feet (bmpAltitude is metres)
+        const float altFt = local.bmpAltitude * 3.28084f;
+
+        // Barometric acceleration: d(verticalSpeed)/dt
+        const unsigned long now = millis();
+        float accelBaro = 0.0f;
+        if (prevTimeMs > 0) {
+            const float dt = static_cast<float>(now - prevTimeMs) / 1000.0f;
+            if (dt > 0.0f) accelBaro = (local.bmpVerticalSpeed - prevVelMs) / dt;
+        }
+        prevVelMs  = local.bmpVerticalSpeed;
+        prevTimeMs = now;
+
+        const int transition = detector.feed(accelMag, altFt, accelBaro);
+        if (transition >= 0) {
+            Serial.printf("[FLIGHT PHASE] %d: %s\n",
+                          transition, FLIGHT_PHASE_NAMES[transition]);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
 
 // --- Configuration Functions ---
 void saveConfiguration() {
@@ -364,7 +558,8 @@ void setup() {
     xTaskCreatePinnedToCore(loggingTask,             "LogTask",  4096, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(buttonTask,              "BtnTask",  2048, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(webServerTask,           "WebTask",  4096, nullptr, 2, nullptr, 0);
-    xTaskCreatePinnedToCore(loraTask,                "LoRaTask", 4096, nullptr, 3, nullptr, 1);
+    xTaskCreatePinnedToCore(loraTask,                "LoRaTask",  4096, nullptr, 3, nullptr, 1);
+    xTaskCreatePinnedToCore(flightPhaseTask,         "PhaseTask", 4096, nullptr, 2, nullptr, 0);
 }
 
 // --- TASKS ---
