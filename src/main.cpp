@@ -24,7 +24,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
-#include <INS_Model_C.h> // Library header
+#include <INS_Model_C.h>
 
 // --- Definitions ---
 #define BMP_CS 18
@@ -364,7 +364,7 @@ void setup() {
     xTaskCreatePinnedToCore(loggingTask,             "LogTask",  4096, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(buttonTask,              "BtnTask",  2048, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(webServerTask,           "WebTask",  4096, nullptr, 2, nullptr, 0);
-    xTaskCreatePinnedToCore(loraTask,                "LoRaTask", 4096, nullptr, 3, nullptr, 1); // Raised priority
+    xTaskCreatePinnedToCore(loraTask,                "LoRaTask", 4096, nullptr, 3, nullptr, 1);
 }
 
 // --- TASKS ---
