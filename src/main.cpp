@@ -93,6 +93,7 @@ struct AllSensorData {
     float gpsLatitude, gpsLongitude, gpsAltitude;
     float gpsSpeed, gpsHeading;
     bool gpsValid;
+    int flightPhase;
 };
 
 // --- Telemetry Packet Structure (Compressed for LoRa) ---
@@ -315,6 +316,12 @@ void flightPhaseTask(void *pvParameters) {
         prevTimeMs = now;
 
         const int transition = detector.feed(accelMag, altFt, accelBaro);
+
+        if (xSemaphoreTake(xSensorDataMutex, portMAX_DELAY) == pdTRUE) {
+            sensorData.flightPhase = detector.phase();
+            xSemaphoreGive(xSensorDataMutex);
+        }
+
         if (transition >= 0) {
             Serial.printf("[FLIGHT PHASE] %d: %s\n",
                           transition, FLIGHT_PHASE_NAMES[transition]);
@@ -493,7 +500,7 @@ void setup() {
                          "BNO_GravX,BNO_GravY,BNO_GravZ,"
                          "BNO_QuatR,BNO_QuatI,BNO_QuatJ,BNO_QuatK,"
                          "GPS_Lat,GPS_Lon,GPS_Alt,GPS_Speed,GPS_Heading,"
-                         "INS_X,INS_Y,INS_Z,INS_Lat,INS_Lon");
+                         "INS_X,INS_Y,INS_Z,INS_Lat,INS_Lon,Flight_Phase");
         dataFile.flush();
     }
 
@@ -769,7 +776,8 @@ void loggingTask(void *pvParameters) {
                 dataFile.print(","); dataFile.print(localIns.Y_Estimate, 2);
                 dataFile.print(","); dataFile.print(localIns.Z_Estimate, 2);
                 dataFile.print(","); dataFile.print(localIns.Lat_Estimate, 7);
-                dataFile.println(localIns.Long_Estimate, 7);
+                dataFile.print(","); dataFile.print(localIns.Long_Estimate, 7);
+                dataFile.println(local.flightPhase);
             }
 
             if (millis() - lastFlush >= 1000) {
