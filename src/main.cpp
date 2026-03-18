@@ -133,18 +133,17 @@ void webServerTask(void *pvParameters);
 void loraTask(void *pvParameters);
 void flightPhaseTask(void *pvParameters);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Flight Phase Detection
-// Ported from State_Prediction.py — no look-ahead, processes one sample at a time.
 //
-// Phase IDs:
+// Flight Phase Detection
+//
+// Phase Numbers:
 //   0 = IDLE  (pre-launch baseline)
 //   1 = LAUNCH
 //   2 = MOTOR BURNOUT
 //   3 = APOGEE
 //   4 = PARACHUTE DEPLOYED
 //   5 = LANDED
-// ─────────────────────────────────────────────────────────────────────────────
+//
 
 static constexpr const char* const FLIGHT_PHASE_NAMES[] = {
     "IDLE",
@@ -179,19 +178,13 @@ public:
         _landStreak = 0;
     }
 
-    // Feed one sample. Returns new phase (0-5) on transition, -1 otherwise.
-    // accel_mag : total acceleration magnitude (m/s²)
-    // alt_ft    : barometric altitude (feet)
-    // accel_baro: d(vertical_speed)/dt (m/s²)
     int feed(float accel_mag, float alt_ft, float accel_baro) {
         const int prev = _phase;
 
-        // ── Baseline collection ──────────────────────────────────────────────
         if (!_baselineDone) {
             if (_blN >= 3) {
                 const float runningMean = _blAccelSum / static_cast<float>(_blN);
                 if (accel_mag > runningMean * 5.0f) {
-                    // Looks like ignition — finalise without this sample, fall through
                     _finaliseBaseline();
                 } else {
                     _accumulate(accel_mag, alt_ft);
@@ -204,33 +197,32 @@ public:
             }
         }
 
-        // ── State machine ────────────────────────────────────────────────────
-
         if (_phase == 0) {
-            // IDLE → LAUNCH: accel_mag > baseline + 5σ, sustained 2+ samples
+            // LAUNCH: Detect sustained acceleration spike (5+ std devs above baseline) over 2 consecutive samples
             const float thresh = _blAccelMean + 5.0f * _blAccelStd;
             _launchStreak = (accel_mag > thresh) ? (_launchStreak + 1) : 0;
             if (_launchStreak >= 2) _phase = 1;
         }
         else if (_phase == 1) {
-            // LAUNCH → MOTOR BURNOUT: accel_mag back within baseline + 2σ for 5 samples
+            // MOTOR BURNOUT: Detect when acceleration drops back below 2 std devs above baseline for 5 consecutive samples
             const float thresh = _blAccelMean + 2.0f * _blAccelStd;
             _burnoutStreak = (accel_mag < thresh) ? (_burnoutStreak + 1) : 0;
             if (_burnoutStreak >= 5) _phase = 2;
         }
         else if (_phase == 2) {
-            // MOTOR BURNOUT → APOGEE: altitude below rolling peak for 8 samples
+            // APOGEE: Track altitude peak and detect when altitude fails to increase for 8 consecutive samples (coasting down)
             if (alt_ft >= _apogeePeak) { _apogeePeak = alt_ft; _apogeeStreak = 0; }
             else                       { _apogeeStreak++; }
             if (_apogeeStreak >= 8) _phase = 3;
         }
         else if (_phase == 3) {
-            // APOGEE → PARACHUTE: statistical spike in accel_baro vs recent noise
+            // PARACHUTE DEPLOYMENT: Circular buffer of barometric acceleration, waiting for impulse detection after warmup
             _chuteBuf[_chuteHead] = accel_baro;
             _chuteHead = (_chuteHead + 1) % CHUTE_BUF_SZ;
             if (_chuteCount < CHUTE_BUF_SZ) _chuteCount++;
             _chuteWarmup++;
 
+            // Calculate rolling mean and std dev of accel_baro, trigger on deviation > 4 std devs (parachute ejection spike)
             if (_chuteWarmup >= 15 && _chuteCount >= 15) {
                 float mean = 0.0f;
                 for (int i = 0; i < _chuteCount; ++i) mean += _chuteBuf[i];
@@ -246,11 +238,10 @@ public:
             }
         }
         else if (_phase == 4) {
-            // PARACHUTE → LANDED: altitude within 15 ft of ground baseline for 10 samples
+            // LANDED: Detect when altitude is within 15 feet of baseline for 10 consecutive samples
             _landStreak = (fabsf(alt_ft - _blAltMean) < 15.0f) ? (_landStreak + 1) : 0;
             if (_landStreak >= 10) _phase = 5;
         }
-        // Phase 5 (LANDED) is terminal
 
         return (_phase != prev) ? _phase : -1;
     }
@@ -559,6 +550,7 @@ void setup() {
     Serial.println("Web Server Started.");
 
     // Tasks
+    // xTaskCreatePinnedToCore(taskFunction, "name", stackSize, params, priority, taskHandle, coreID)
     xTaskCreatePinnedToCore(highFrequencySensorTask, "SensTask", 4096, nullptr, 3, nullptr, 1);
     xTaskCreatePinnedToCore(insTask,                 "INSTask",  8192, nullptr, 3, nullptr, 1);
     xTaskCreatePinnedToCore(gpsTask,                 "GPSTask",  4096, nullptr, 1, nullptr, 1);
@@ -777,7 +769,7 @@ void loggingTask(void *pvParameters) {
                 dataFile.print(","); dataFile.print(localIns.Z_Estimate, 2);
                 dataFile.print(","); dataFile.print(localIns.Lat_Estimate, 7);
                 dataFile.print(","); dataFile.print(localIns.Long_Estimate, 7);
-                dataFile.println(local.flightPhase);
+                dataFile.print(","); dataFile.println(local.flightPhase);
             }
 
             if (millis() - lastFlush >= 1000) {
