@@ -5,27 +5,27 @@
 #include "Adafruit_BMP5xx.h"
 #include <SparkFun_MMC5983MA_Arduino_Library.h>
 
-// --- CS Pin Definitions ---
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
+
 const int CS_ICM = 3;
 const int CS_BMP = 41;
 const int CS_MMC = 45;
 const int CS_OTHER = 5;
 
-// --- Sensor Objects ---
 ICM42688 IMU(SPI, CS_ICM);
 Adafruit_BMP5xx bmp;
 SFE_MMC5983MA myMag;
 
-// --- Timing Variables ---
-unsigned long lastPollTime = 0;
-const unsigned long pollInterval = 10000; // 100 Hz = 10,000 microseconds
+SemaphoreHandle_t spiMutex = NULL;
+volatile uint32_t pollCount = 0;
+SemaphoreHandle_t countMutex = NULL;
 
-unsigned long lastPrintTime = 0;
-const unsigned long printInterval = 5000000; // 5 seconds = 5,000,000 microseconds
-unsigned long pollCount = 0;
+void SensorPollTask(void* pvParameters);
+void PrintTask(void* pvParameters);
 
 void setup() {
-  // 1. Deselect all SPI devices to prevent bus collisions during initialization
   pinMode(CS_ICM, OUTPUT); digitalWrite(CS_ICM, HIGH);
   pinMode(CS_BMP, OUTPUT); digitalWrite(CS_BMP, HIGH);
   pinMode(CS_MMC, OUTPUT); digitalWrite(CS_MMC, HIGH);
@@ -38,26 +38,22 @@ void setup() {
 
   SPI.begin();
 
-  // --- Initialize ICM42688 ---
   int status = IMU.begin();
   if (status < 0) {
     Serial.println("Failed: ICM42688 initialization unsuccessful.");
     while(1) delay(10);
   }
 
-  // --- Initialize BMP5xx ---
   if (!bmp.begin(CS_BMP, &SPI)) {
     Serial.println("Failed: BMP5xx initialization unsuccessful.");
     while (1) delay(10);
   }
-  // Optimize BMP5xx for ~100Hz operation
   bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
   bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);
   bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_3);
-  bmp.setOutputDataRate(BMP5XX_ODR_100_2_HZ); // Output rate ~100 Hz
+  bmp.setOutputDataRate(BMP5XX_ODR_100_2_HZ);
   bmp.setPowerMode(BMP5XX_POWERMODE_CONTINUOUS);
 
-  // --- Initialize MMC5983MA ---
   if (myMag.begin(CS_MMC) == false) {
     Serial.println("Failed: MMC5983MA initialization unsuccessful.");
     while(1) delay(10);
@@ -66,55 +62,88 @@ void setup() {
   delay(20);
   myMag.enableAutomaticSetReset();
 
-  // *** NEW: Put MMC5983MA into Continuous Mode ***
-  // Valid frequencies: 1000, 200, 100, 50, 20, 10, 1, 0 (off)
   myMag.setContinuousModeFrequency(100);
   myMag.enableContinuousMode();
 
   Serial.println("Success: All 3 sensors initialized okay.");
 
-  // Prime the timers
-  lastPollTime = micros();
-  lastPrintTime = micros();
+  spiMutex = xSemaphoreCreateMutex();
+  if (spiMutex == NULL) {
+    Serial.println("Failed to create SPI mutex");
+    while (1) delay(10);
+  }
+
+  countMutex = xSemaphoreCreateMutex();
+  if (countMutex == NULL) {
+    Serial.println("Failed to create counter mutex");
+    while (1) delay(10);
+  }
+
+  BaseType_t r1 = xTaskCreate(
+    SensorPollTask,
+    "SensorPoll",
+    2048,
+    NULL,
+    tskIDLE_PRIORITY + 2,
+    NULL
+  );
+
+  BaseType_t r2 = xTaskCreate(
+    PrintTask,
+    "Printer",
+    1024,
+    NULL,
+    tskIDLE_PRIORITY + 1,
+    NULL
+  );
+
+  if (r1 != pdPASS || r2 != pdPASS) {
+    Serial.println("Failed to create FreeRTOS tasks");
+    while (1) delay(10);
+  }
 }
 
 void loop() {
-  unsigned long currentMicros = micros();
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
 
-  // Trigger exactly every 10,000 microseconds (100 Hz)
-  if (currentMicros - lastPollTime >= pollInterval) {
-    // Add interval to lastPollTime rather than setting it to currentMicros
-    // to strictly prevent timing drift over time.
-    lastPollTime += pollInterval;
+void SensorPollTask(void* pvParameters) {
+  const TickType_t xFrequency = pdMS_TO_TICKS(10);
+  TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    // 1. Poll ICM42688
-    IMU.getAGT();
+  for (;;) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    // 2. Poll BMP5xx
-    bmp.performReading();
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+      IMU.getAGT();
+      bmp.performReading();
+      uint32_t currentX = 0, currentY = 0, currentZ = 0;
+      myMag.readFieldsXYZ(&currentX, &currentY, &currentZ);
+      myMag.clearMeasDoneInterrupt();
+      xSemaphoreGive(spiMutex);
+    }
 
-    // 3. Poll MMC5983MA (Non-blocking continuous read)
-    uint32_t currentX, currentY, currentZ;
-
-    // Instantly grabs whatever is in the registers without waiting
-    myMag.readFieldsXYZ(&currentX, &currentY, &currentZ);
-
-    // Clear the hardware flag so the sensor knows it can push the next reading
-    myMag.clearMeasDoneInterrupt();
-
-    pollCount++;
+    if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
+      pollCount++;
+      xSemaphoreGive(countMutex);
+    }
   }
+}
 
-  // Trigger every 5,000,000 microseconds (5 seconds)
-  if (currentMicros - lastPrintTime >= printInterval) {
-    float averageFreq = (float)pollCount / 5.0;
+void PrintTask(void* pvParameters) {
+  const TickType_t printDelay = pdMS_TO_TICKS(5000);
+  for (;;) {
+    vTaskDelay(printDelay);
+    uint32_t count = 0;
+    if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
+      count = pollCount;
+      pollCount = 0;
+      xSemaphoreGive(countMutex);
+    }
 
+    float averageFreq = (float)count / 5.0f;
     Serial.print("Average Polling Frequency: ");
     Serial.print(averageFreq);
     Serial.println(" Hz");
-
-    // Reset counters
-    pollCount = 0;
-    lastPrintTime = currentMicros;
   }
 }
