@@ -1,17 +1,4 @@
-// ============================================================
-// LIFTSv2 Sensor Logger with USB Mass Storage Mode
-// ------------------------------------------------------------
-// Boots into LOGGER mode by default. Press the button to safely
-// close the log file and reboot into MSC mode (SD appears as a
-// USB drive on the host computer). Press the button again in
-// MSC mode to reboot back into LOGGER mode.
-//
-// IMPORTANT — Arduino IDE settings required:
-//   Tools -> USB Mode: "USB-OTG (TinyUSB)"
-//   Tools -> USB CDC On Boot: "Enabled"
-// Without TinyUSB mode selected, USBMSC will not compile.
-// ============================================================
-
+// ReSharper disable All
 #include "ICM42688.h"
 #include <Wire.h>
 #include <SPI.h>
@@ -24,6 +11,9 @@
 #include <FreeRTOS.h>
 #include <task.h>
 #include <semphr.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
 
 #include "USB.h"
 #include "USBMSC.h"
@@ -35,82 +25,59 @@ extern "C" {
   #include "esp_system.h"
 }
 
-// ------------------------------------------------------------
-// Pin definitions
-// ------------------------------------------------------------
+constexpr int CS_ICM = 3;
+constexpr int CS_BMP = 41;
+constexpr int CS_MMC = 45;
+constexpr int CS_OTHER = 5;
+constexpr int CS_SD = 40;
+constexpr int SD_MOSI = 39;
+constexpr int SD_MISO = 38;
+constexpr int SD_CLK = 47;
+constexpr int BUTTON_PIN = 16;
+constexpr int RED_LED = 26;
+constexpr int GREEN_LED = 48;
+constexpr int BLUE_LED = 21;
 
-// Sensor SPI Configuration (default SPI / FSPI)
-const int CS_ICM   = 3;
-const int CS_BMP   = 41;
-const int CS_MMC   = 45;
-const int CS_OTHER = 5;
-
-// SD Card SPI Configuration (custom pins on HSPI / SPI3)
-const int CS_SD   = 40;
-const int SD_MOSI = 39;
-const int SD_MISO = 38;
-const int SD_CLK  = 47;
-
-// User interface
-const int BUTTON_PIN = 16;
-const int RED_LED    = 26;
-const int GREEN_LED  = 48;
-const int BLUE_LED   = 21;
-
-// ------------------------------------------------------------
-// Runtime mode flags
-// ------------------------------------------------------------
-// If true we booted into MSC mode (held button during boot). When in MSC
-// mode the device remains a storage device until a full restart.
 bool inMSCMode = false;
-
-// Whether logging is currently active (writing to a CSV). The button
-// toggles this when running in logger mode.
 bool loggingActive = false;
-
-// RTC flag to request boot into MSC on next restart. Set this before
-// calling esp_restart() to ensure the boot path enters MSC mode.
 RTC_DATA_ATTR uint32_t bootToMSC = 0;
-
-// Long-press tracking to avoid retriggering while held
 bool longPressHandled = false;
 
-// ------------------------------------------------------------
-// Globals
-// ------------------------------------------------------------
 SPIClass* sdcardSPI = nullptr;
 
-ICM42688 IMU(SPI, CS_ICM);
+ICM42688* IMU = nullptr;
 Adafruit_BMP5xx bmp;
 SFE_MMC5983MA myMag;
 
+static auto ap_ssid = "LIFTSv2";
+static auto ap_password = "123456789";
+WebServer webServer(80);
+
+float seaLevelPressureHpa = 1013.25f;
+
 SemaphoreHandle_t sensorSpiMutex = nullptr;
-SemaphoreHandle_t sdSpiMutex     = nullptr;
-SemaphoreHandle_t countMutex     = nullptr;
+SemaphoreHandle_t sdSpiMutex = nullptr;
+SemaphoreHandle_t countMutex = nullptr;
 
 volatile uint32_t pollCount = 0;
+volatile bool stopSensorTask = false;
+volatile bool stopSdTask = false;
+volatile bool sensorTaskStopped = false;
+volatile bool sdLogTaskStopped = false;
 
-// Task shutdown signalling
-volatile bool stopSensorTask     = false;
-volatile bool stopSdTask         = false;
-volatile bool sensorTaskStopped  = false;
-volatile bool sdLogTaskStopped   = false;
-
-// MSC mode resources
 USBMSC msc;
 sdmmc_card_t* mscCard = nullptr;
 
-// Button state
-int  lastButtonState   = LOW;
+int lastButtonState = LOW;
 unsigned long pressStartTime = 0;
-const unsigned long debounceLockout = 200;
+constexpr unsigned long debounceLockout = 200;
 
 struct SensorSample {
   uint32_t sampleMillis;
   float accelX, accelY, accelZ;
   float gyroX, gyroY, gyroZ;
   float imuTemp;
-  float bmpTemp, bmpPressure;
+  float bmpTemp, bmpPressure, bmpAltitude;
   uint32_t magX, magY, magZ;
 };
 
@@ -118,23 +85,14 @@ QueueHandle_t logQueue = nullptr;
 File logFile;
 char currentFilename[32];
 
-// Forward for start/stop logging helpers
 void startLogging();
 void stopLogging();
 
-// ------------------------------------------------------------
-// Sensor reader templates (SFINAE chain for portability across
-// different ICM42688 library variants).
-// ------------------------------------------------------------
 namespace {
 
 template <int N> struct PriorityTag : PriorityTag<N - 1> {};
-template <>      struct PriorityTag<0> {};
+template <> struct PriorityTag<0> {};
 
-// Try to detect either data members or accessor methods. Prefer methods
-// when available (many ICM libraries expose accX() etc.). We use a
-// higher-priority tag for method forms and a slightly lower priority for
-// member forms.
 #define DEFINE_SENSOR_READER(FuncName, Member1, Member2, Member3, Member4) \
   template <typename T> \
   auto FuncName##_impl(T& obj, PriorityTag<8>) -> decltype((void)obj.Member1(), float()) { return obj.Member1(); } \
@@ -159,35 +117,49 @@ template <>      struct PriorityTag<0> {};
 DEFINE_SENSOR_READER(readImuAccelX, accX, accelX, aX, AccelX)
 DEFINE_SENSOR_READER(readImuAccelY, accY, accelY, aY, AccelY)
 DEFINE_SENSOR_READER(readImuAccelZ, accZ, accelZ, aZ, AccelZ)
-DEFINE_SENSOR_READER(readImuGyroX,  gyrX, gyroX, gX, GyroX)
-DEFINE_SENSOR_READER(readImuGyroY,  gyrY, gyroY, gY, GyroY)
-DEFINE_SENSOR_READER(readImuGyroZ,  gyrZ, gyroZ, gZ, GyroZ)
-DEFINE_SENSOR_READER(readImuTemp,   temp, temperature, Temperature, Temp)
+DEFINE_SENSOR_READER(readImuGyroX, gyrX, gyroX, gX, GyroX)
+DEFINE_SENSOR_READER(readImuGyroY, gyrY, gyroY, gY, GyroY)
+DEFINE_SENSOR_READER(readImuGyroZ, gyrZ, gyroZ, gZ, GyroZ)
+DEFINE_SENSOR_READER(readImuTemp, temp, temperature, Temperature, Temp)
 
 #undef DEFINE_SENSOR_READER
 
-}  // namespace
+}
 
-// ------------------------------------------------------------
-// Forward declarations
-// ------------------------------------------------------------
 void SensorPollTask(void* pvParameters);
 void SdLogTask(void* pvParameters);
 void PrintTask(void* pvParameters);
-
+void ControlTask(void* pvParameters);
 void setupLoggerMode();
 void setupMSCMode();
+void webServerTask(void* pvParameters);
+
+void handleRoot();
+void handleGetCsvList();
+void handleFileDownload();
+void handleGetConfig();
+void handleUpdateConfig();
+void handleNotFound();
+
+void saveConfiguration();
+void loadConfiguration();
+bool parsePressureFromBody(const String& body, float& outPressure);
 
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
-  analogWrite(RED_LED,   r);
+  analogWrite(RED_LED, r);
   analogWrite(GREEN_LED, g);
-  analogWrite(BLUE_LED,  b);
+  analogWrite(BLUE_LED, b);
 }
 
 void ledHeartbeat() {
   unsigned long t = millis() % 2000;
-  int brightness = (t < 1000) ? (t * 40 / 1000) : ((2000 - t) * 40 / 1000);
-  setRGB(0, brightness, 0);
+  unsigned long brightness_ul = (t < 1000UL) ? (t * 40UL / 1000UL) : ((2000UL - t) * 40UL / 1000UL);
+  setRGB(0, static_cast<uint8_t>(brightness_ul), 0);
+}
+
+void flashYellow() {
+  setRGB(150, 80, 0);
+  delay(250);
 }
 
 [[noreturn]] void blinkRedForever() {
@@ -203,24 +175,22 @@ uint32_t findNextLogFileIndex() {
   uint32_t fileIndex = 0;
   char candidate[32];
   while (true) {
-    snprintf(candidate, sizeof(candidate), "/log_%lu.csv", (unsigned long)fileIndex);
+    snprintf(candidate, sizeof(candidate), "/log_%lu.csv", static_cast<unsigned long>(fileIndex));
     if (!SD.exists(candidate)) return fileIndex;
     fileIndex++;
   }
 }
 
 bool initSDForMSC() {
-  esp_err_t ret;
-
   spi_bus_config_t bus_cfg = {};
-  bus_cfg.mosi_io_num     = SD_MOSI;
-  bus_cfg.miso_io_num     = SD_MISO;
-  bus_cfg.sclk_io_num     = SD_CLK;
-  bus_cfg.quadwp_io_num   = -1;
-  bus_cfg.quadhd_io_num   = -1;
+  bus_cfg.mosi_io_num = SD_MOSI;
+  bus_cfg.miso_io_num = SD_MISO;
+  bus_cfg.sclk_io_num = SD_CLK;
+  bus_cfg.quadwp_io_num = -1;
+  bus_cfg.quadhd_io_num = -1;
   bus_cfg.max_transfer_sz = 4096;
 
-  ret = spi_bus_initialize(SPI3_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
+  esp_err_t ret = spi_bus_initialize(SPI3_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
   if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
     Serial.printf("spi_bus_initialize failed: %s\n", esp_err_to_name(ret));
     return false;
@@ -233,7 +203,7 @@ bool initSDForMSC() {
   }
 
   sdspi_device_config_t dev_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
-  dev_cfg.gpio_cs = (gpio_num_t)CS_SD;
+  dev_cfg.gpio_cs = static_cast<gpio_num_t>(CS_SD);
   dev_cfg.host_id = SPI3_HOST;
 
   sdspi_dev_handle_t handle;
@@ -244,10 +214,10 @@ bool initSDForMSC() {
   }
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-  host.slot         = handle;
+  host.slot = handle;
   host.max_freq_khz = 20000;
 
-  mscCard = (sdmmc_card_t*)malloc(sizeof(sdmmc_card_t));
+  mscCard = static_cast<sdmmc_card_t*>(malloc(sizeof(sdmmc_card_t)));
   if (!mscCard) return false;
 
   ret = sdmmc_card_init(&host, mscCard);
@@ -258,22 +228,20 @@ bool initSDForMSC() {
     return false;
   }
 
-  Serial.printf("SD card initialised for MSC: %llu sectors of %u bytes\n",
-                (unsigned long long)mscCard->csd.capacity,
-                (unsigned)mscCard->csd.sector_size);
+  Serial.printf("SD card initialised for MSC: %llu sectors of %u bytes\n", static_cast<unsigned long long>(mscCard->csd.capacity), static_cast<unsigned>(mscCard->csd.sector_size));
   return true;
 }
 
 static int32_t mscOnRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
   if (!mscCard) return -1;
   if (sdmmc_read_sectors(mscCard, buffer, lba, bufsize / 512) != ESP_OK) return -1;
-  return bufsize;
+  return static_cast<int32_t>(bufsize);
 }
 
-static int32_t mscOnWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+static int32_t mscOnWrite(uint32_t lba, uint32_t offset, const uint8_t* buffer, uint32_t bufsize) {
   if (!mscCard) return -1;
   if (sdmmc_write_sectors(mscCard, buffer, lba, bufsize / 512) != ESP_OK) return -1;
-  return bufsize;
+  return static_cast<int32_t>(bufsize);
 }
 
 static bool mscOnStartStop(uint8_t power_condition, bool start, bool load_eject) {
@@ -295,7 +263,7 @@ void setupMSCMode() {
   msc.productID("Logger");
   msc.productRevision("1.0");
   msc.onRead(mscOnRead);
-  msc.onWrite(mscOnWrite);
+  msc.onWrite(reinterpret_cast<msc_write_cb>(mscOnWrite));
   msc.onStartStop(mscOnStartStop);
   msc.mediaPresent(true);
   msc.begin(mscCard->csd.capacity, mscCard->csd.sector_size);
@@ -311,18 +279,23 @@ void setupLoggerMode() {
   Serial.println("=== Entering LOGGER mode ===");
   setRGB(50, 25, 0);
 
-  pinMode(CS_ICM,   OUTPUT); digitalWrite(CS_ICM,   HIGH);
-  pinMode(CS_BMP,   OUTPUT); digitalWrite(CS_BMP,   HIGH);
-  pinMode(CS_MMC,   OUTPUT); digitalWrite(CS_MMC,   HIGH);
+  pinMode(CS_ICM, OUTPUT); digitalWrite(CS_ICM, HIGH);
+  pinMode(CS_BMP, OUTPUT); digitalWrite(CS_BMP, HIGH);
+  pinMode(CS_MMC, OUTPUT); digitalWrite(CS_MMC, HIGH);
   pinMode(CS_OTHER, OUTPUT); digitalWrite(CS_OTHER, HIGH);
-  pinMode(CS_SD,    OUTPUT); digitalWrite(CS_SD,    HIGH);
+  pinMode(CS_SD, OUTPUT); digitalWrite(CS_SD, HIGH);
 
   SPI.begin();
 
   sdcardSPI = new SPIClass(HSPI);
   sdcardSPI->begin(SD_CLK, SD_MISO, SD_MOSI, CS_SD);
-
-  int status = IMU.begin();
+  if (!SD.begin(CS_SD, *sdcardSPI, 4000000)) {
+    Serial.println("Warning: SD card initialisation unsuccessful (web server may be limited). Will retry when logging starts.");
+  } else {
+    loadConfiguration();
+  }
+  if (!IMU) IMU = new ICM42688(SPI, CS_ICM);
+  int status = IMU->begin();
   if (status < 0) {
     Serial.println("Failed: ICM42688 initialisation unsuccessful.");
     setRGB(150, 0, 0);
@@ -353,8 +326,8 @@ void setupLoggerMode() {
 
   Serial.println("Success: All 3 sensors initialised okay.");
   sensorSpiMutex = xSemaphoreCreateMutex();
-  sdSpiMutex     = xSemaphoreCreateMutex();
-  countMutex     = xSemaphoreCreateMutex();
+  sdSpiMutex = xSemaphoreCreateMutex();
+  countMutex = xSemaphoreCreateMutex();
   if (!sensorSpiMutex || !sdSpiMutex || !countMutex) {
     Serial.println("Failed to create mutexes");
     setRGB(150, 0, 0);
@@ -368,6 +341,22 @@ void setupLoggerMode() {
     while (true) delay(10);
   }
 
+  webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/list-csv", HTTP_GET, handleGetCsvList);
+  webServer.on("/download", HTTP_GET, handleFileDownload);
+  webServer.on("/getconfig", HTTP_GET, handleGetConfig);
+  webServer.on("/updateconfig", HTTP_POST, handleUpdateConfig);
+  webServer.onNotFound(handleNotFound);
+
+  WiFi.softAP(ap_ssid, ap_password);
+  webServer.begin();
+  BaseType_t rws = xTaskCreate(webServerTask, "WebSrv", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  if (rws != pdPASS) {
+    Serial.println("Failed to create WebServer task");
+  } else {
+    Serial.println("Web server started (AP mode). Connect to WiFi to access files.");
+  }
+
   startLogging();
 
   Serial.println("Press button to stop/start logging, or hold button during boot for MSC.");
@@ -377,7 +366,7 @@ void startLogging() {
   if (loggingActive) return;
 
   Serial.println("Starting logging: initialising SD and creating tasks...");
-  setRGB(50, 25, 0);
+  flashYellow();
 
   if (!SD.begin(CS_SD, *sdcardSPI, 4000000)) {
     Serial.println("Failed: SD card initialisation unsuccessful.");
@@ -386,7 +375,7 @@ void startLogging() {
   }
 
   uint32_t fileIndex = findNextLogFileIndex();
-  snprintf(currentFilename, sizeof(currentFilename), "/log_%lu.csv", (unsigned long)fileIndex);
+  snprintf(currentFilename, sizeof(currentFilename), "/log_%lu.csv", static_cast<unsigned long>(fileIndex));
 
   logFile = SD.open(currentFilename, FILE_WRITE);
   if (!logFile) {
@@ -395,7 +384,7 @@ void startLogging() {
     return;
   }
 
-  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,magX,magY,magZ");
+  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,magX,magY,magZ");
   logFile.flush();
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
@@ -413,7 +402,7 @@ void startLogging() {
   sdLogTaskStopped = false;
 
   BaseType_t r1 = xTaskCreate(SensorPollTask, "SensorPoll", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr);
-  BaseType_t r3 = xTaskCreate(SdLogTask,      "SDLog",      4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  BaseType_t r3 = xTaskCreate(SdLogTask, "SDLog", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
   if (r1 != pdPASS || r3 != pdPASS) {
     Serial.println("Failed to create FreeRTOS tasks");
@@ -428,7 +417,7 @@ void stopLogging() {
   if (!loggingActive) return;
 
   Serial.println("Stopping logging and closing file...");
-  setRGB(150, 80, 0);
+  flashYellow();
 
   stopSensorTask = true;
   unsigned long t0 = millis();
@@ -452,9 +441,9 @@ void stopLogging() {
 
 void setup() {
   pinMode(BUTTON_PIN, INPUT);
-  pinMode(RED_LED,    OUTPUT);
-  pinMode(GREEN_LED,  OUTPUT);
-  pinMode(BLUE_LED,   OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
   setRGB(0, 0, 0);
 
   Serial.begin(115200);
@@ -481,50 +470,57 @@ void setup() {
     Serial.println(" -> Logger mode");
     setupLoggerMode();
   }
+
+  xTaskCreatePinnedToCore(ControlTask, "CtrlTask", 4096, nullptr, 2, nullptr, 0);
 }
 
 void loop() {
-  int btn = digitalRead(BUTTON_PIN);
-  unsigned long now = millis();
-  if (btn == HIGH && lastButtonState == LOW) {
-    pressStartTime = now;
-    lastButtonState = HIGH;
-    longPressHandled = false;
-  } else if (btn == HIGH && lastButtonState == HIGH) {
-    if (!longPressHandled && (now - pressStartTime >= 2000)) {
-      longPressHandled = true;
-      Serial.println("Long press detected: stopping logging and rebooting into MSC...");
-      if (loggingActive) stopLogging();
-      bootToMSC = 1;
-      Serial.println("Rebooting now...");
-      Serial.flush();
-      esp_restart();
-    }
-  } else if (btn == LOW && lastButtonState == HIGH) {
-    unsigned long pressDuration = now - pressStartTime;
-    lastButtonState = LOW;
-    if (pressDuration >= debounceLockout) {
-      if (inMSCMode) {
-        Serial.println("Button released while in MSC mode (ignored). Restart to exit MSC.");
-      } else {
-        if (!longPressHandled) {
-          if (loggingActive) stopLogging(); else startLogging();
+}
+
+void ControlTask(void* pvParameters) {
+  for (;;) {
+    int btn = digitalRead(BUTTON_PIN);
+    unsigned long now = millis();
+    if (btn == HIGH && lastButtonState == LOW) {
+      pressStartTime = now;
+      lastButtonState = HIGH;
+      longPressHandled = false;
+    } else if (btn == HIGH && lastButtonState == HIGH) {
+      if (!longPressHandled && (now - pressStartTime >= 2000)) {
+        longPressHandled = true;
+        Serial.println("Long press detected: stopping logging and rebooting into MSC...");
+        if (loggingActive) stopLogging();
+        bootToMSC = 1;
+        Serial.println("Rebooting now...");
+        Serial.flush();
+        esp_restart();
+      }
+    } else if (btn == LOW && lastButtonState == HIGH) {
+      unsigned long pressDuration = now - pressStartTime;
+      lastButtonState = LOW;
+      if (pressDuration >= debounceLockout) {
+        if (inMSCMode) {
+          Serial.println("Button released while in MSC mode (ignored). Restart to exit MSC.");
+        } else {
+          if (!longPressHandled) {
+            if (loggingActive) stopLogging(); else startLogging();
+          }
         }
       }
     }
-  }
 
-  if (inMSCMode) {
-    setRGB(0, 0, 80);
-  } else {
-    if (loggingActive) ledHeartbeat(); else setRGB(0, 20, 0);
-  }
+    if (inMSCMode) {
+      setRGB(0, 0, 80);
+    } else {
+      if (loggingActive) ledHeartbeat(); else setRGB(0, 20, 0);
+    }
 
-  delay(20);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 void SensorPollTask(void* pvParameters) {
-  const TickType_t xFrequency = pdMS_TO_TICKS(10);
+  constexpr TickType_t xFrequency = pdMS_TO_TICKS(10);
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   for (;;) {
@@ -537,18 +533,19 @@ void SensorPollTask(void* pvParameters) {
 
     SensorSample sample{};
 
-    if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
-      IMU.getAGT();
+        if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
+          if (IMU) IMU->getAGT();
       bmp.performReading();
-      sample.accelX = readImuAccelX(IMU);
-      sample.accelY = readImuAccelY(IMU);
-      sample.accelZ = readImuAccelZ(IMU);
-      sample.gyroX  = readImuGyroX(IMU);
-      sample.gyroY  = readImuGyroY(IMU);
-      sample.gyroZ  = readImuGyroZ(IMU);
-      sample.imuTemp     = readImuTemp(IMU);
-      sample.bmpTemp     = bmp.temperature;
-      sample.bmpPressure = bmp.pressure;
+          sample.accelX = IMU ? readImuAccelX(*IMU) : 0.0f;
+          sample.accelY = IMU ? readImuAccelY(*IMU) : 0.0f;
+          sample.accelZ = IMU ? readImuAccelZ(*IMU) : 0.0f;
+          sample.gyroX = IMU ? readImuGyroX(*IMU) : 0.0f;
+          sample.gyroY = IMU ? readImuGyroY(*IMU) : 0.0f;
+          sample.gyroZ = IMU ? readImuGyroZ(*IMU) : 0.0f;
+          sample.imuTemp = IMU ? readImuTemp(*IMU) : 0.0f;
+      sample.bmpTemp = bmp.temperature;
+      sample.bmpPressure = static_cast<float>(bmp.pressure) / 100.0f;
+      sample.bmpAltitude = bmp.readAltitude(seaLevelPressureHpa);
       myMag.readFieldsXYZ(&sample.magX, &sample.magY, &sample.magZ);
       myMag.clearMeasDoneInterrupt();
       xSemaphoreGive(sensorSpiMutex);
@@ -582,6 +579,7 @@ void SdLogTask(void* pvParameters) {
     logFile.print(sample.imuTemp, 6);            logFile.print(',');
     logFile.print(sample.bmpTemp, 6);            logFile.print(',');
     logFile.print(sample.bmpPressure, 6);        logFile.print(',');
+    logFile.print(sample.bmpAltitude, 6);        logFile.print(',');
     logFile.print(sample.magX);                  logFile.print(',');
     logFile.print(sample.magY);                  logFile.print(',');
     logFile.println(sample.magZ);
@@ -624,7 +622,7 @@ void SdLogTask(void* pvParameters) {
 }
 
 void PrintTask(void* pvParameters) {
-  const TickType_t printDelay = pdMS_TO_TICKS(5000);
+  constexpr TickType_t printDelay = pdMS_TO_TICKS(5000);
   for (;;) {
     vTaskDelay(printDelay);
     uint32_t count = 0;
@@ -633,9 +631,160 @@ void PrintTask(void* pvParameters) {
       pollCount = 0;
       xSemaphoreGive(countMutex);
     }
-    float averageFreq = (float)count / 5.0f;
+    const float averageFreq = static_cast<float>(count) / 5.0f;
     Serial.print("Average Polling Frequency: ");
     Serial.print(averageFreq);
     Serial.println(" Hz");
   }
 }
+
+void webServerTask(void* pvParameters) {
+  for (;;) {
+    webServer.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void handleRoot() {
+  File file = SD.open("/index.html");
+  if (!file) {
+    webServer.send(500, "text/plain", "ERROR: index.html not found on SD");
+    return;
+  }
+  webServer.streamFile(file, "text/html");
+  file.close();
+}
+
+void handleGetCsvList() {
+  String json = "[";
+  File root = SD.open("/");
+  if (root) {
+    File file = root.openNextFile();
+    bool firstFile = true;
+    while (file) {
+      const char* fileName = file.name();
+      if (strstr(fileName, ".csv")) {
+        if (!firstFile) json += ",";
+        json += "\"";
+        if (fileName[0] == '/') json += (fileName + 1);
+        else json += fileName;
+        json += "\"";
+        firstFile = false;
+      }
+      file.close();
+      file = root.openNextFile();
+    }
+    root.close();
+  }
+  json += "]";
+  webServer.send(200, "application/json", json);
+}
+
+void handleFileDownload() {
+  if (webServer.hasArg("file")) {
+    const String fileName = webServer.arg("file");
+    if (fileName.indexOf('/') != -1 || fileName.indexOf("..") != -1) {
+      webServer.send(400, "text/plain", "Invalid filename.");
+      return;
+    }
+    String path = "/" + fileName;
+    File file = SD.open(path);
+    if (!file) {
+      webServer.send(404, "text/plain", "File not found.");
+      return;
+    }
+    webServer.sendHeader("Content-Disposition", "attachment; filename=" + fileName);
+    webServer.streamFile(file, "text/csv");
+    file.close();
+  } else {
+    webServer.send(400, "text/plain", "Bad Request: 'file' missing.");
+  }
+}
+
+void handleGetConfig() {
+  JsonDocument doc;
+  doc["pressure"] = String(seaLevelPressureHpa, 2);
+  String output;
+  serializeJson(doc, output);
+  webServer.send(200, "application/json", output);
+}
+
+
+void handleUpdateConfig() {
+  String body = webServer.arg("plain");
+  if (body.length() == 0) {
+    webServer.send(400, "text/plain", "Empty body");
+    return;
+  }
+  float newPressure = NAN;
+  if (!parsePressureFromBody(body, newPressure) || newPressure < 800.0f || newPressure > 1200.0f) {
+    webServer.send(400, "text/plain", "Invalid pressure value");
+    return;
+  }
+  seaLevelPressureHpa = newPressure;
+  saveConfiguration();
+  webServer.send(200, "text/plain", "Config updated");
+}
+
+void handleNotFound() {
+  webServer.send(404, "text/plain", "Not Found");
+}
+
+void saveConfiguration() {
+  File f = SD.open("/config.txt", FILE_WRITE);
+  if (!f) return;
+  f.print("pressure=");
+  f.println(String(seaLevelPressureHpa, 2));
+  f.close();
+}
+
+void loadConfiguration() {
+  File f = SD.open("/config.txt");
+  if (!f) {
+    Serial.println("config.txt not found on SD (using default sea level pressure). Creating default.");
+    saveConfiguration();
+    return;
+  }
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("pressure=")) {
+      String val = line.substring(line.indexOf('=') + 1);
+      float p = val.toFloat();
+      if (p >= 800.0f && p <= 1200.0f) {
+        seaLevelPressureHpa = p;
+      }
+    }
+  }
+  f.close();
+  Serial.printf("Loaded sea level pressure: %.2f hPa\n", static_cast<double>(seaLevelPressureHpa));
+}
+
+bool parsePressureFromBody(const String& body, float& outPressure) {
+  String s = body;
+  s.trim();
+
+  int keyPos = s.indexOf("pressure");
+  if (keyPos >= 0) {
+    int sep = s.indexOf('=', keyPos);
+    if (sep < 0) sep = s.indexOf(':', keyPos);
+    if (sep >= 0) {
+      String num = s.substring(sep + 1);
+      num.trim();
+      if (num.startsWith("\"")) num.remove(0, 1);
+      if (num.endsWith("\"")) num.remove(num.length() - 1);
+      while (num.length() > 0) {
+        const char c = num.charAt(num.length() - 1);
+        const bool numericTail = (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
+        if (numericTail) break;
+        num.remove(num.length() - 1);
+      }
+      outPressure = num.toFloat();
+      return !isnan(outPressure);
+    }
+  }
+
+  outPressure = s.toFloat();
+  return !isnan(outPressure);
+}
+
