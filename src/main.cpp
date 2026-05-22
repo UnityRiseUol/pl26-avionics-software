@@ -8,6 +8,7 @@
 #include "Adafruit_BMP5xx.h"
 #include <SparkFun_MMC5983MA_Arduino_Library.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
+#include <LoRa.h>
 
 #include <FreeRTOS.h>
 #include <task.h>
@@ -29,11 +30,14 @@ extern "C" {
 constexpr int CS_ICM = 3;
 constexpr int CS_BMP = 41;
 constexpr int CS_MMC = 45;
-constexpr int CS_OTHER = 5;
+constexpr int RFM95_CS = 5;
+constexpr int RFM95_RST = 14;
+constexpr int RFM95_INT = 15;
 constexpr int CS_SD = 40;
 constexpr int SD_MOSI = 39;
 constexpr int SD_MISO = 38;
 constexpr int SD_CLK = 47;
+constexpr long BAND = 868E6;
 constexpr int BUTTON_PIN = 16;
 constexpr int RED_LED = 26;
 constexpr int GREEN_LED = 48;
@@ -61,6 +65,7 @@ SemaphoreHandle_t sensorSpiMutex = nullptr;
 SemaphoreHandle_t sdSpiMutex = nullptr;
 SemaphoreHandle_t countMutex = nullptr;
 SemaphoreHandle_t gpsDataMutex = nullptr;
+SemaphoreHandle_t telemetryMutex = nullptr;
 
 volatile uint32_t pollCount = 0;
 volatile bool stopSensorTask = false;
@@ -89,17 +94,39 @@ struct SensorSample {
   float accelX, accelY, accelZ;
   float gyroX, gyroY, gyroZ;
   float imuTemp;
-  float bmpTemp, bmpPressure, bmpAltitude;
+  float bmpTemp, bmpPressure, bmpAltitude, bmpVSpeed;
   uint32_t magX, magY, magZ;
   GpsSample gps;
 };
+
+// Must remain exactly 44 bytes for the ground station decoder.
+struct __attribute__((packed)) TelemetryPacket {
+  float altitude;
+  float vSpeed;
+  float lat;
+  float lon;
+  float qR;
+  float qI;
+  float qJ;
+  float qK;
+  float insX;
+  float insY;
+  float insZ;
+};
+
+static_assert(sizeof(TelemetryPacket) == 44, "TelemetryPacket must remain 44 bytes");
 
 QueueHandle_t logQueue = nullptr;
 File logFile;
 char currentFilename[32];
 GpsSample latestGpsSample{};
+SensorSample latestSensorSample{};
+bool haveLastBmpAltitude = false;
+float lastBmpAltitude = 0.0f;
+uint32_t lastBmpAltitudeMillis = 0;
 
 bool initGPS();
+bool initLoRa();
 void startLogging();
 void stopLogging();
 
@@ -144,6 +171,7 @@ DEFINE_SENSOR_READER(readImuTemp, temp, temperature, Temperature, Temp)
 void SensorPollTask(void* pvParameters);
 void SdLogTask(void* pvParameters);
 void GpsTask(void* pvParameters);
+void LoRaTask(void* pvParameters);
 void PrintTask(void* pvParameters);
 void ControlTask(void* pvParameters);
 void setupLoggerMode();
@@ -206,6 +234,31 @@ bool initGPS() {
   }
 
   Serial.println(F("u-blox GNSS Initialized Successfully."));
+  return true;
+}
+
+bool initLoRa() {
+  pinMode(RFM95_CS, OUTPUT);
+  digitalWrite(RFM95_CS, HIGH);
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
+  pinMode(RFM95_INT, INPUT);
+
+  LoRa.setSPI(SPI);
+  LoRa.setPins(RFM95_CS, RFM95_RST, RFM95_INT);
+
+  if (!LoRa.begin(BAND)) {
+    Serial.println(F("LoRa initialization failed. Check wiring/PCB."));
+    return false;
+  }
+
+  LoRa.setTxPower(20);
+  LoRa.setSignalBandwidth(500E3);
+  LoRa.setSpreadingFactor(7);
+  LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
+
+  Serial.println(F("LoRa Initialized. Beginning telemetry transmission."));
   return true;
 }
 
@@ -310,7 +363,6 @@ void setupLoggerMode() {
   pinMode(CS_ICM, OUTPUT); digitalWrite(CS_ICM, HIGH);
   pinMode(CS_BMP, OUTPUT); digitalWrite(CS_BMP, HIGH);
   pinMode(CS_MMC, OUTPUT); digitalWrite(CS_MMC, HIGH);
-  pinMode(CS_OTHER, OUTPUT); digitalWrite(CS_OTHER, HIGH);
   pinMode(CS_SD, OUTPUT); digitalWrite(CS_SD, HIGH);
 
   SPI.begin();
@@ -358,12 +410,18 @@ void setupLoggerMode() {
     blinkRedForever();
   }
 
+  const bool loraReady = initLoRa();
+  if (!loraReady) {
+    Serial.println("Warning: LoRa initialisation unsuccessful. Telemetry task not started.");
+  }
+
   Serial.println("Success: All sensors initialised okay.");
   sensorSpiMutex = xSemaphoreCreateMutex();
   sdSpiMutex = xSemaphoreCreateMutex();
   countMutex = xSemaphoreCreateMutex();
   gpsDataMutex = xSemaphoreCreateMutex();
-  if (!sensorSpiMutex || !sdSpiMutex || !countMutex || !gpsDataMutex) {
+  telemetryMutex = xSemaphoreCreateMutex();
+  if (!sensorSpiMutex || !sdSpiMutex || !countMutex || !gpsDataMutex || !telemetryMutex) {
     Serial.println("Failed to create mutexes");
     setRGB(150, 0, 0);
     while (true) delay(10);
@@ -374,6 +432,13 @@ void setupLoggerMode() {
     Serial.println("Failed to create PrintTask");
     setRGB(150, 0, 0);
     while (true) delay(10);
+  }
+
+  if (loraReady) {
+    BaseType_t rlora = xTaskCreate(LoRaTask, "LoRaTx", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+    if (rlora != pdPASS) {
+      Serial.println("Failed to create LoRaTask");
+    }
   }
 
   webServer.on("/", HTTP_GET, handleRoot);
@@ -419,7 +484,7 @@ void startLogging() {
     return;
   }
 
-  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading");
+  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading");
   logFile.flush();
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
@@ -432,6 +497,10 @@ void startLogging() {
   }
 
   latestGpsSample = {};
+  latestSensorSample = {};
+  haveLastBmpAltitude = false;
+  lastBmpAltitude = 0.0f;
+  lastBmpAltitudeMillis = 0;
   stopSensorTask = false;
   stopSdTask = false;
   stopGpsTask = false;
@@ -576,19 +645,32 @@ void SensorPollTask(void* pvParameters) {
 
     SensorSample sample{};
 
-        if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
-          if (IMU) IMU->getAGT();
-      bmp.performReading();
-          sample.accelX = IMU ? readImuAccelX(*IMU) : 0.0f;
-          sample.accelY = IMU ? readImuAccelY(*IMU) : 0.0f;
-          sample.accelZ = IMU ? readImuAccelZ(*IMU) : 0.0f;
-          sample.gyroX = IMU ? readImuGyroX(*IMU) : 0.0f;
-          sample.gyroY = IMU ? readImuGyroY(*IMU) : 0.0f;
-          sample.gyroZ = IMU ? readImuGyroZ(*IMU) : 0.0f;
-          sample.imuTemp = IMU ? readImuTemp(*IMU) : 0.0f;
-      sample.bmpTemp = bmp.temperature;
-      sample.bmpPressure = static_cast<float>(bmp.pressure) / 100.0f;
-      sample.bmpAltitude = bmp.readAltitude(seaLevelPressureHpa);
+    if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
+      if (IMU) IMU->getAGT();
+      if (bmp.performReading()) {
+        sample.accelX = IMU ? readImuAccelX(*IMU) : 0.0f;
+        sample.accelY = IMU ? readImuAccelY(*IMU) : 0.0f;
+        sample.accelZ = IMU ? readImuAccelZ(*IMU) : 0.0f;
+        sample.gyroX = IMU ? readImuGyroX(*IMU) : 0.0f;
+        sample.gyroY = IMU ? readImuGyroY(*IMU) : 0.0f;
+        sample.gyroZ = IMU ? readImuGyroZ(*IMU) : 0.0f;
+        sample.imuTemp = IMU ? readImuTemp(*IMU) : 0.0f;
+        sample.bmpTemp = bmp.temperature;
+        sample.bmpPressure = static_cast<float>(bmp.pressure) / 100.0f;
+        sample.bmpAltitude = bmp.readAltitude(seaLevelPressureHpa);
+
+        const uint32_t nowMillis = millis();
+        sample.bmpVSpeed = 0.0f;
+        if (haveLastBmpAltitude) {
+          const uint32_t deltaMillis = nowMillis - lastBmpAltitudeMillis;
+          if (deltaMillis > 0) {
+            sample.bmpVSpeed = (sample.bmpAltitude - lastBmpAltitude) / (static_cast<float>(deltaMillis) / 1000.0f);
+          }
+        }
+        lastBmpAltitude = sample.bmpAltitude;
+        lastBmpAltitudeMillis = nowMillis;
+        haveLastBmpAltitude = true;
+      }
       myMag.readFieldsXYZ(&sample.magX, &sample.magY, &sample.magZ);
       myMag.clearMeasDoneInterrupt();
       xSemaphoreGive(sensorSpiMutex);
@@ -600,6 +682,11 @@ void SensorPollTask(void* pvParameters) {
     }
 
     sample.sampleMillis = millis();
+
+    if (telemetryMutex && xSemaphoreTake(telemetryMutex, portMAX_DELAY) == pdTRUE) {
+      latestSensorSample = sample;
+      xSemaphoreGive(telemetryMutex);
+    }
 
     if (logQueue != nullptr) {
       xQueueSend(logQueue, &sample, pdMS_TO_TICKS(50));
@@ -644,6 +731,48 @@ void GpsTask(void* pvParameters) {
         xSemaphoreGive(gpsDataMutex);
       }
     }
+    else {
+      GpsSample sampleGps{};
+      if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
+        latestGpsSample = sampleGps;
+        xSemaphoreGive(gpsDataMutex);
+      }
+    }
+  }
+}
+
+void LoRaTask(void* pvParameters) {
+  constexpr TickType_t txPeriod = pdMS_TO_TICKS(100);
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&lastWakeTime, txPeriod);
+
+    TelemetryPacket packet{};
+
+    if (telemetryMutex && xSemaphoreTake(telemetryMutex, portMAX_DELAY) == pdTRUE) {
+      packet.altitude = latestSensorSample.bmpAltitude;
+      packet.vSpeed = latestSensorSample.bmpVSpeed;
+      xSemaphoreGive(telemetryMutex);
+    }
+
+    if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
+      if (latestGpsSample.valid) {
+        packet.lat = latestGpsSample.latitude;
+        packet.lon = latestGpsSample.longitude;
+      }
+      xSemaphoreGive(gpsDataMutex);
+    }
+
+    // Quaternion and INS estimates are not available in this build yet, so they remain zero.
+    // Packet is intentionally zero-initialised to preserve the ground-station layout.
+    if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
+      if (LoRa.beginPacket()) {
+        LoRa.write(reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
+        LoRa.endPacket();
+      }
+      xSemaphoreGive(sensorSpiMutex);
+    }
   }
 }
 
@@ -663,6 +792,7 @@ void SdLogTask(void* pvParameters) {
     logFile.print(sample.bmpTemp, 6);            logFile.print(',');
     logFile.print(sample.bmpPressure, 6);        logFile.print(',');
     logFile.print(sample.bmpAltitude, 6);        logFile.print(',');
+    logFile.print(sample.bmpVSpeed, 6);          logFile.print(',');
     logFile.print(sample.magX);                  logFile.print(',');
     logFile.print(sample.magY);                  logFile.print(',');
     logFile.print(sample.magZ);                  logFile.print(',');
