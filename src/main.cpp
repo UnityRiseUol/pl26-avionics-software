@@ -7,6 +7,7 @@
 #include <Adafruit_Sensor.h>
 #include "Adafruit_BMP5xx.h"
 #include <SparkFun_MMC5983MA_Arduino_Library.h>
+#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 
 #include <FreeRTOS.h>
 #include <task.h>
@@ -48,6 +49,7 @@ SPIClass* sdcardSPI = nullptr;
 ICM42688* IMU = nullptr;
 Adafruit_BMP5xx bmp;
 SFE_MMC5983MA myMag;
+SFE_UBLOX_GNSS myGNSS;
 
 static auto ap_ssid = "LIFTSv2";
 static auto ap_password = "123456789";
@@ -58,12 +60,15 @@ float seaLevelPressureHpa = 1013.25f;
 SemaphoreHandle_t sensorSpiMutex = nullptr;
 SemaphoreHandle_t sdSpiMutex = nullptr;
 SemaphoreHandle_t countMutex = nullptr;
+SemaphoreHandle_t gpsDataMutex = nullptr;
 
 volatile uint32_t pollCount = 0;
 volatile bool stopSensorTask = false;
 volatile bool stopSdTask = false;
+volatile bool stopGpsTask = false;
 volatile bool sensorTaskStopped = false;
 volatile bool sdLogTaskStopped = false;
+volatile bool gpsTaskStopped = false;
 
 USBMSC msc;
 sdmmc_card_t* mscCard = nullptr;
@@ -72,6 +77,13 @@ int lastButtonState = LOW;
 unsigned long pressStartTime = 0;
 constexpr unsigned long debounceLockout = 200;
 
+struct GpsSample {
+  uint32_t fixMillis;
+  bool valid;
+  long rawLat, rawLon, rawAlt, rawSpeed, rawHeading;
+  float latitude, longitude, altitude, speed, heading;
+};
+
 struct SensorSample {
   uint32_t sampleMillis;
   float accelX, accelY, accelZ;
@@ -79,12 +91,15 @@ struct SensorSample {
   float imuTemp;
   float bmpTemp, bmpPressure, bmpAltitude;
   uint32_t magX, magY, magZ;
+  GpsSample gps;
 };
 
 QueueHandle_t logQueue = nullptr;
 File logFile;
 char currentFilename[32];
+GpsSample latestGpsSample{};
 
+bool initGPS();
 void startLogging();
 void stopLogging();
 
@@ -128,6 +143,7 @@ DEFINE_SENSOR_READER(readImuTemp, temp, temperature, Temperature, Temp)
 
 void SensorPollTask(void* pvParameters);
 void SdLogTask(void* pvParameters);
+void GpsTask(void* pvParameters);
 void PrintTask(void* pvParameters);
 void ControlTask(void* pvParameters);
 void setupLoggerMode();
@@ -179,6 +195,18 @@ uint32_t findNextLogFileIndex() {
     if (!SD.exists(candidate)) return fileIndex;
     fileIndex++;
   }
+}
+
+bool initGPS() {
+  Wire.begin();
+
+  if (myGNSS.begin() == false) {
+    Serial.println(F("u-blox GNSS not detected at default I2C address. Please check wiring. Freezing."));
+    return false;
+  }
+
+  Serial.println(F("u-blox GNSS Initialized Successfully."));
+  return true;
 }
 
 bool initSDForMSC() {
@@ -324,11 +352,18 @@ void setupLoggerMode() {
   myMag.setContinuousModeFrequency(100);
   myMag.enableContinuousMode();
 
-  Serial.println("Success: All 3 sensors initialised okay.");
+  if (!initGPS()) {
+    Serial.println("Failed: GNSS initialisation unsuccessful.");
+    setRGB(150, 0, 0);
+    blinkRedForever();
+  }
+
+  Serial.println("Success: All sensors initialised okay.");
   sensorSpiMutex = xSemaphoreCreateMutex();
   sdSpiMutex = xSemaphoreCreateMutex();
   countMutex = xSemaphoreCreateMutex();
-  if (!sensorSpiMutex || !sdSpiMutex || !countMutex) {
+  gpsDataMutex = xSemaphoreCreateMutex();
+  if (!sensorSpiMutex || !sdSpiMutex || !countMutex || !gpsDataMutex) {
     Serial.println("Failed to create mutexes");
     setRGB(150, 0, 0);
     while (true) delay(10);
@@ -384,7 +419,7 @@ void startLogging() {
     return;
   }
 
-  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,magX,magY,magZ");
+  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading");
   logFile.flush();
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
@@ -396,15 +431,19 @@ void startLogging() {
     return;
   }
 
+  latestGpsSample = {};
   stopSensorTask = false;
   stopSdTask = false;
+  stopGpsTask = false;
   sensorTaskStopped = false;
   sdLogTaskStopped = false;
+  gpsTaskStopped = false;
 
+  BaseType_t r0 = xTaskCreate(GpsTask, "GpsPoll", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   BaseType_t r1 = xTaskCreate(SensorPollTask, "SensorPoll", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr);
   BaseType_t r3 = xTaskCreate(SdLogTask, "SDLog", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
-  if (r1 != pdPASS || r3 != pdPASS) {
+  if (r0 != pdPASS || r1 != pdPASS || r3 != pdPASS) {
     Serial.println("Failed to create FreeRTOS tasks");
     setRGB(150, 0, 0);
     return;
@@ -422,6 +461,10 @@ void stopLogging() {
   stopSensorTask = true;
   unsigned long t0 = millis();
   while (!sensorTaskStopped && (millis() - t0) < 2000) delay(10);
+
+  stopGpsTask = true;
+  t0 = millis();
+  while (!gpsTaskStopped && (millis() - t0) < 3000) delay(10);
 
   stopSdTask = true;
   t0 = millis();
@@ -551,6 +594,11 @@ void SensorPollTask(void* pvParameters) {
       xSemaphoreGive(sensorSpiMutex);
     }
 
+    if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
+      sample.gps = latestGpsSample;
+      xSemaphoreGive(gpsDataMutex);
+    }
+
     sample.sampleMillis = millis();
 
     if (logQueue != nullptr) {
@@ -560,6 +608,41 @@ void SensorPollTask(void* pvParameters) {
     if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
       pollCount++;
       xSemaphoreGive(countMutex);
+    }
+  }
+}
+
+void GpsTask(void* pvParameters) {
+  constexpr TickType_t xFrequency = pdMS_TO_TICKS(1000);
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    if (stopGpsTask) {
+      gpsTaskStopped = true;
+      vTaskDelete(nullptr);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    if (myGNSS.getPVT()) {
+      GpsSample sampleGps{};
+      sampleGps.fixMillis = millis();
+      sampleGps.rawLat = myGNSS.getLatitude();
+      sampleGps.rawLon = myGNSS.getLongitude();
+      sampleGps.rawAlt = myGNSS.getAltitude();
+      sampleGps.rawSpeed = myGNSS.getGroundSpeed();
+      sampleGps.rawHeading = myGNSS.getHeading();
+      sampleGps.latitude = sampleGps.rawLat / 10000000.0f;
+      sampleGps.longitude = sampleGps.rawLon / 10000000.0f;
+      sampleGps.altitude = sampleGps.rawAlt / 1000.0f;
+      sampleGps.speed = sampleGps.rawSpeed / 1000.0f;
+      sampleGps.heading = sampleGps.rawHeading / 100000.0f;
+      sampleGps.valid = true;
+
+      if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
+        latestGpsSample = sampleGps;
+        xSemaphoreGive(gpsDataMutex);
+      }
     }
   }
 }
@@ -582,7 +665,14 @@ void SdLogTask(void* pvParameters) {
     logFile.print(sample.bmpAltitude, 6);        logFile.print(',');
     logFile.print(sample.magX);                  logFile.print(',');
     logFile.print(sample.magY);                  logFile.print(',');
-    logFile.println(sample.magZ);
+    logFile.print(sample.magZ);                  logFile.print(',');
+    logFile.print(sample.gps.fixMillis);         logFile.print(',');
+    logFile.print(sample.gps.valid ? 1 : 0);     logFile.print(',');
+    logFile.print(sample.gps.latitude, 7);       logFile.print(',');
+    logFile.print(sample.gps.longitude, 7);      logFile.print(',');
+    logFile.print(sample.gps.altitude, 3);       logFile.print(',');
+    logFile.print(sample.gps.speed, 3);          logFile.print(',');
+    logFile.println(sample.gps.heading, 3);
   };
 
   for (;;) {
