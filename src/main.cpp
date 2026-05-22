@@ -51,11 +51,36 @@ Adafruit_BMP5xx bmp;
 SFE_MMC5983MA myMag;
 SFE_UBLOX_GNSS myGNSS;
 
-static auto ap_ssid = "LIFTSv2";
-static auto ap_password = "123456789";
+String ap_ssid = "LIFTSv2";
+String ap_password = "123456789";
 WebServer webServer(80);
 
+// ===== Configuration Variables =====
 float seaLevelPressureHpa = 1013.25f;
+
+// Sensor sampling rates (ms)
+uint32_t sensorSampleRateMs = 10;      // IMU/BMP/MAG sampling rate
+uint32_t gpsSampleRateMs = 1000;       // GPS sampling rate
+uint32_t logFlushIntervalMs = 1000;    // SD card flush interval
+
+// LED brightness (0-255)
+uint8_t ledBrightnessHeartbeat = 40;
+uint8_t ledBrightnessIdle = 20;
+
+// Flight detection thresholds
+float launchThresholdMultiplier = 5.0f;    // Launch detection: baseline_accel + (N * baseline_std)
+float burnoutThresholdMultiplier = 2.0f;   // Burnout detection threshold
+int launchStreakRequired = 2;              // Consecutive samples for launch
+int burnoutStreakRequired = 5;             // Consecutive samples for burnout
+int apogeeStreakRequired = 8;              // Consecutive samples past apogee
+int landStreakRequired = 10;               // Consecutive samples for landing
+float landingAltitudeThresholdFt = 15.0f;  // Altitude threshold for landing detection
+
+// BMP5xx sensor settings
+bmp5xx_oversampling_t bmpTempOversampling = BMP5XX_OVERSAMPLING_2X;
+bmp5xx_oversampling_t bmpPressOversampling = BMP5XX_OVERSAMPLING_16X;
+bmp5xx_iir_filter_t bmpIirFilterCoeff = BMP5XX_IIR_FILTER_COEFF_3;
+bmp5xx_odr_t bmpOutputDataRate = BMP5XX_ODR_100_2_HZ;
 
 SemaphoreHandle_t sensorSpiMutex = nullptr;
 SemaphoreHandle_t sdSpiMutex = nullptr;
@@ -168,19 +193,19 @@ public:
         }
 
         if (_phase == 0) {
-            const float thresh = _blAccelMean + 5.0f * _blAccelStd;
+            const float thresh = _blAccelMean + launchThresholdMultiplier * _blAccelStd;
             _launchStreak = (accel_mag > thresh) ? (_launchStreak + 1) : 0;
-            if (_launchStreak >= 2) _phase = 1;
+            if (_launchStreak >= launchStreakRequired) _phase = 1;
         }
         else if (_phase == 1) {
-            const float thresh = _blAccelMean + 2.0f * _blAccelStd;
+            const float thresh = _blAccelMean + burnoutThresholdMultiplier * _blAccelStd;
             _burnoutStreak = (accel_mag < thresh) ? (_burnoutStreak + 1) : 0;
-            if (_burnoutStreak >= 5) _phase = 2;
+            if (_burnoutStreak >= burnoutStreakRequired) _phase = 2;
         }
         else if (_phase == 2) {
             if (alt_ft >= _apogeePeak) { _apogeePeak = alt_ft; _apogeeStreak = 0; }
             else                       { _apogeeStreak++; }
-            if (_apogeeStreak >= 8) _phase = 3;
+            if (_apogeeStreak >= apogeeStreakRequired) _phase = 3;
         }
         else if (_phase == 3) {
             _chuteBuf[_chuteHead] = accel_baro;
@@ -203,8 +228,8 @@ public:
             }
         }
         else if (_phase == 4) {
-            _landStreak = (fabsf(alt_ft - _blAltMean) < 15.0f) ? (_landStreak + 1) : 0;
-            if (_landStreak >= 10) _phase = 5;
+            _landStreak = (fabsf(alt_ft - _blAltMean) < landingAltitudeThresholdFt) ? (_landStreak + 1) : 0;
+            if (_landStreak >= landStreakRequired) _phase = 5;
         }
 
         return (_phase != prev) ? _phase : -1;
@@ -300,7 +325,6 @@ void handleNotFound();
 
 void saveConfiguration();
 void loadConfiguration();
-bool parsePressureFromBody(const String& body, float& outPressure);
 
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   analogWrite(RED_LED, r);
@@ -310,7 +334,7 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
 
 void ledHeartbeat() {
   unsigned long t = millis() % 2000;
-  unsigned long brightness_ul = (t < 1000UL) ? (t * 40UL / 1000UL) : ((2000UL - t) * 40UL / 1000UL);
+  unsigned long brightness_ul = (t < 1000UL) ? (t * static_cast<unsigned long>(ledBrightnessHeartbeat) / 1000UL) : ((2000UL - t) * static_cast<unsigned long>(ledBrightnessHeartbeat) / 1000UL);
   setRGB(0, static_cast<uint8_t>(brightness_ul), 0);
 }
 
@@ -476,10 +500,10 @@ void setupLoggerMode() {
     setRGB(150, 0, 0);
     blinkRedForever();
   }
-  bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
-  bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);
-  bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_3);
-  bmp.setOutputDataRate(BMP5XX_ODR_100_2_HZ);
+  bmp.setTemperatureOversampling(bmpTempOversampling);
+  bmp.setPressureOversampling(bmpPressOversampling);
+  bmp.setIIRFilterCoeff(bmpIirFilterCoeff);
+  bmp.setOutputDataRate(bmpOutputDataRate);
   bmp.setPowerMode(BMP5XX_POWERMODE_CONTINUOUS);
 
   if (myMag.begin(CS_MMC) == false) {
@@ -704,7 +728,7 @@ void ControlTask(void* pvParameters) {
     if (inMSCMode) {
       setRGB(0, 0, 80);
     } else {
-      if (loggingActive) ledHeartbeat(); else setRGB(0, 20, 0);
+      if (loggingActive) ledHeartbeat(); else setRGB(0, ledBrightnessIdle, 0);
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -712,7 +736,7 @@ void ControlTask(void* pvParameters) {
 }
 
 void SensorPollTask(void* pvParameters) {
-  constexpr TickType_t xFrequency = pdMS_TO_TICKS(10);
+  TickType_t xFrequency = pdMS_TO_TICKS(sensorSampleRateMs);
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   for (;;) {
@@ -767,7 +791,7 @@ void SensorPollTask(void* pvParameters) {
 }
 
 void GpsTask(void* pvParameters) {
-  constexpr TickType_t xFrequency = pdMS_TO_TICKS(1000);
+  TickType_t xFrequency = pdMS_TO_TICKS(gpsSampleRateMs);
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   for (;;) {
@@ -917,7 +941,7 @@ void SdLogTask(void* pvParameters) {
       } while (xQueueReceive(logQueue, &sample, 0) == pdTRUE);
     }
 
-    if ((xTaskGetTickCount() - lastFlush) >= pdMS_TO_TICKS(1000)) {
+    if ((xTaskGetTickCount() - lastFlush) >= pdMS_TO_TICKS(logFlushIntervalMs)) {
       if (xSemaphoreTake(sdSpiMutex, portMAX_DELAY) == pdTRUE) {
         logFile.flush();
         xSemaphoreGive(sdSpiMutex);
@@ -1010,6 +1034,21 @@ void handleFileDownload() {
 void handleGetConfig() {
   JsonDocument doc;
   doc["pressure"] = String(seaLevelPressureHpa, 2);
+  doc["sensorSampleRateMs"] = sensorSampleRateMs;
+  doc["gpsSampleRateMs"] = gpsSampleRateMs;
+  doc["logFlushIntervalMs"] = logFlushIntervalMs;
+  doc["ledBrightnessHeartbeat"] = ledBrightnessHeartbeat;
+  doc["ledBrightnessIdle"] = ledBrightnessIdle;
+  doc["launchThresholdMultiplier"] = String(launchThresholdMultiplier, 2);
+  doc["burnoutThresholdMultiplier"] = String(burnoutThresholdMultiplier, 2);
+  doc["launchStreakRequired"] = launchStreakRequired;
+  doc["burnoutStreakRequired"] = burnoutStreakRequired;
+  doc["apogeeStreakRequired"] = apogeeStreakRequired;
+  doc["landStreakRequired"] = landStreakRequired;
+  doc["landingAltitudeThresholdFt"] = String(landingAltitudeThresholdFt, 2);
+  doc["wifiSSID"] = ap_ssid;
+  doc["wifiPassword"] = ap_password;
+
   String output;
   serializeJson(doc, output);
   webServer.send(200, "application/json", output);
@@ -1022,12 +1061,72 @@ void handleUpdateConfig() {
     webServer.send(400, "text/plain", "Empty body");
     return;
   }
-  float newPressure = NAN;
-  if (!parsePressureFromBody(body, newPressure) || newPressure < 800.0f || newPressure > 1200.0f) {
-    webServer.send(400, "text/plain", "Invalid pressure value");
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+  if (error) {
+    webServer.send(400, "text/plain", "Invalid JSON");
     return;
   }
-  seaLevelPressureHpa = newPressure;
+
+   if (doc["pressure"].is<float>()) {
+     float p = doc["pressure"].as<float>();
+     if (p >= 800.0f && p <= 1200.0f) seaLevelPressureHpa = p;
+     else { webServer.send(400, "text/plain", "Invalid pressure value"); return; }
+   }
+   if (doc["sensorSampleRateMs"].is<uint32_t>()) {
+     uint32_t val = doc["sensorSampleRateMs"].as<uint32_t>();
+     if (val >= 5 && val <= 10000) sensorSampleRateMs = val;
+   }
+   if (doc["gpsSampleRateMs"].is<uint32_t>()) {
+     uint32_t val = doc["gpsSampleRateMs"].as<uint32_t>();
+     if (val >= 100 && val <= 60000) gpsSampleRateMs = val;
+   }
+   if (doc["logFlushIntervalMs"].is<uint32_t>()) {
+     uint32_t val = doc["logFlushIntervalMs"].as<uint32_t>();
+     if (val >= 500 && val <= 60000) logFlushIntervalMs = val;
+   }
+   if (doc["ledBrightnessHeartbeat"].is<uint8_t>()) {
+     ledBrightnessHeartbeat = doc["ledBrightnessHeartbeat"].as<uint8_t>();
+   }
+   if (doc["ledBrightnessIdle"].is<uint8_t>()) {
+     ledBrightnessIdle = doc["ledBrightnessIdle"].as<uint8_t>();
+   }
+   if (doc["launchThresholdMultiplier"].is<float>()) {
+     float val = doc["launchThresholdMultiplier"].as<float>();
+     if (val >= 1.0f && val <= 20.0f) launchThresholdMultiplier = val;
+   }
+   if (doc["burnoutThresholdMultiplier"].is<float>()) {
+     float val = doc["burnoutThresholdMultiplier"].as<float>();
+     if (val >= 0.5f && val <= 10.0f) burnoutThresholdMultiplier = val;
+   }
+   if (doc["launchStreakRequired"].is<int>()) {
+     int val = doc["launchStreakRequired"].as<int>();
+     if (val >= 1 && val <= 50) launchStreakRequired = val;
+   }
+   if (doc["burnoutStreakRequired"].is<int>()) {
+     int val = doc["burnoutStreakRequired"].as<int>();
+     if (val >= 1 && val <= 100) burnoutStreakRequired = val;
+   }
+   if (doc["apogeeStreakRequired"].is<int>()) {
+     int val = doc["apogeeStreakRequired"].as<int>();
+     if (val >= 1 && val <= 100) apogeeStreakRequired = val;
+   }
+   if (doc["landStreakRequired"].is<int>()) {
+     int val = doc["landStreakRequired"].as<int>();
+     if (val >= 1 && val <= 100) landStreakRequired = val;
+   }
+   if (doc["landingAltitudeThresholdFt"].is<float>()) {
+     float val = doc["landingAltitudeThresholdFt"].as<float>();
+     if (val >= 1.0f && val <= 500.0f) landingAltitudeThresholdFt = val;
+   }
+   if (doc["wifiSSID"].is<String>()) {
+     ap_ssid = doc["wifiSSID"].as<String>();
+   }
+   if (doc["wifiPassword"].is<String>()) {
+     ap_password = doc["wifiPassword"].as<String>();
+   }
+
   saveConfiguration();
   webServer.send(200, "text/plain", "Config updated");
 }
@@ -1039,58 +1138,131 @@ void handleNotFound() {
 void saveConfiguration() {
   File f = SD.open("/config.txt", FILE_WRITE);
   if (!f) return;
+
   f.print("pressure=");
   f.println(String(seaLevelPressureHpa, 2));
+
+  f.print("sensorSampleRateMs=");
+  f.println(sensorSampleRateMs);
+
+  f.print("gpsSampleRateMs=");
+  f.println(gpsSampleRateMs);
+
+  f.print("logFlushIntervalMs=");
+  f.println(logFlushIntervalMs);
+
+  f.print("ledBrightnessHeartbeat=");
+  f.println(ledBrightnessHeartbeat);
+
+  f.print("ledBrightnessIdle=");
+  f.println(ledBrightnessIdle);
+
+  f.print("launchThresholdMultiplier=");
+  f.println(String(launchThresholdMultiplier, 2));
+
+  f.print("burnoutThresholdMultiplier=");
+  f.println(String(burnoutThresholdMultiplier, 2));
+
+  f.print("launchStreakRequired=");
+  f.println(launchStreakRequired);
+
+  f.print("burnoutStreakRequired=");
+  f.println(burnoutStreakRequired);
+
+  f.print("apogeeStreakRequired=");
+  f.println(apogeeStreakRequired);
+
+  f.print("landStreakRequired=");
+  f.println(landStreakRequired);
+
+  f.print("landingAltitudeThresholdFt=");
+  f.println(String(landingAltitudeThresholdFt, 2));
+
+  f.print("wifiSSID=");
+  f.println(ap_ssid);
+
+  f.print("wifiPassword=");
+  f.println(ap_password);
+
   f.close();
 }
 
 void loadConfiguration() {
   File f = SD.open("/config.txt");
   if (!f) {
-    Serial.println("config.txt not found on SD (using default sea level pressure). Creating default.");
+    Serial.println("config.txt not found on SD (using defaults). Creating default.");
     saveConfiguration();
     return;
   }
+
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
+
     if (line.startsWith("pressure=")) {
       String val = line.substring(line.indexOf('=') + 1);
       float p = val.toFloat();
-      if (p >= 800.0f && p <= 1200.0f) {
-        seaLevelPressureHpa = p;
-      }
+      if (p >= 800.0f && p <= 1200.0f) seaLevelPressureHpa = p;
+    }
+    else if (line.startsWith("sensorSampleRateMs=")) {
+      sensorSampleRateMs = line.substring(line.indexOf('=') + 1).toInt();
+      if (sensorSampleRateMs < 5) sensorSampleRateMs = 5;
+    }
+    else if (line.startsWith("gpsSampleRateMs=")) {
+      gpsSampleRateMs = line.substring(line.indexOf('=') + 1).toInt();
+      if (gpsSampleRateMs < 100) gpsSampleRateMs = 100;
+    }
+    else if (line.startsWith("logFlushIntervalMs=")) {
+      logFlushIntervalMs = line.substring(line.indexOf('=') + 1).toInt();
+      if (logFlushIntervalMs < 500) logFlushIntervalMs = 500;
+    }
+    else if (line.startsWith("ledBrightnessHeartbeat=")) {
+      ledBrightnessHeartbeat = line.substring(line.indexOf('=') + 1).toInt();
+    }
+    else if (line.startsWith("ledBrightnessIdle=")) {
+      ledBrightnessIdle = line.substring(line.indexOf('=') + 1).toInt();
+    }
+    else if (line.startsWith("launchThresholdMultiplier=")) {
+      launchThresholdMultiplier = line.substring(line.indexOf('=') + 1).toFloat();
+      if (launchThresholdMultiplier < 1.0f) launchThresholdMultiplier = 1.0f;
+    }
+    else if (line.startsWith("burnoutThresholdMultiplier=")) {
+      burnoutThresholdMultiplier = line.substring(line.indexOf('=') + 1).toFloat();
+      if (burnoutThresholdMultiplier < 0.5f) burnoutThresholdMultiplier = 0.5f;
+    }
+    else if (line.startsWith("launchStreakRequired=")) {
+      launchStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (launchStreakRequired < 1) launchStreakRequired = 1;
+    }
+    else if (line.startsWith("burnoutStreakRequired=")) {
+      burnoutStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (burnoutStreakRequired < 1) burnoutStreakRequired = 1;
+    }
+    else if (line.startsWith("apogeeStreakRequired=")) {
+      apogeeStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (apogeeStreakRequired < 1) apogeeStreakRequired = 1;
+    }
+    else if (line.startsWith("landStreakRequired=")) {
+      landStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (landStreakRequired < 1) landStreakRequired = 1;
+    }
+    else if (line.startsWith("landingAltitudeThresholdFt=")) {
+      landingAltitudeThresholdFt = line.substring(line.indexOf('=') + 1).toFloat();
+      if (landingAltitudeThresholdFt < 1.0f) landingAltitudeThresholdFt = 1.0f;
+    }
+    else if (line.startsWith("wifiSSID=")) {
+      ap_ssid = line.substring(line.indexOf('=') + 1);
+    }
+    else if (line.startsWith("wifiPassword=")) {
+      ap_password = line.substring(line.indexOf('=') + 1);
     }
   }
+
   f.close();
-  Serial.printf("Loaded sea level pressure: %.2f hPa\n", static_cast<double>(seaLevelPressureHpa));
+  Serial.printf("Loaded configuration: pressure=%.2f hPa, sensorRate=%lu ms, gpsRate=%lu ms\n",
+                static_cast<double>(seaLevelPressureHpa),
+                static_cast<unsigned long>(sensorSampleRateMs),
+                static_cast<unsigned long>(gpsSampleRateMs));
 }
 
-bool parsePressureFromBody(const String& body, float& outPressure) {
-  String s = body;
-  s.trim();
-
-  int keyPos = s.indexOf("pressure");
-  if (keyPos >= 0) {
-    int sep = s.indexOf('=', keyPos);
-    if (sep < 0) sep = s.indexOf(':', keyPos);
-    if (sep >= 0) {
-      String num = s.substring(sep + 1);
-      num.trim();
-      if (num.startsWith("\"")) num.remove(0, 1);
-      if (num.endsWith("\"")) num.remove(num.length() - 1);
-      while (num.length() > 0) {
-        const char c = num.charAt(num.length() - 1);
-        const bool numericTail = (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
-        if (numericTail) break;
-        num.remove(num.length() - 1);
-      }
-      outPressure = num.toFloat();
-      return !isnan(outPressure);
-    }
-  }
-
-  outPressure = s.toFloat();
-  return !isnan(outPressure);
-}
 
