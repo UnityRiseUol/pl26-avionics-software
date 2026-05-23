@@ -59,32 +59,22 @@ String ap_ssid = "LIFTSv2";
 String ap_password = "123456789";
 WebServer webServer(80);
 
-// ===== Configuration Variables =====
 float seaLevelPressureHpa = 1013.25f;
 
-// Sensor sampling rates (ms)
-uint32_t sensorSampleRateMs = 10;      // IMU/BMP/MAG sampling rate
-uint32_t gpsSampleRateMs = 1000;       // GPS sampling rate
-uint32_t logFlushIntervalMs = 1000;    // SD card flush interval
+uint32_t sensorSampleRateMs = 10;
+uint32_t gpsSampleRateMs = 1000;
+uint32_t logFlushIntervalMs = 1000;
 
-// LED brightness (0-255)
 uint8_t ledBrightnessHeartbeat = 40;
 uint8_t ledBrightnessIdle = 20;
 
-// Flight detection thresholds
-float launchThresholdMultiplier = 5.0f;    // Launch detection: baseline_accel + (N * baseline_std)
-float burnoutThresholdMultiplier = 2.0f;   // Burnout detection threshold
-int launchStreakRequired = 2;              // Consecutive samples for launch
-int burnoutStreakRequired = 5;             // Consecutive samples for burnout
-int apogeeStreakRequired = 8;              // Consecutive samples past apogee
-int landStreakRequired = 10;               // Consecutive samples for landing
-float landingAltitudeThresholdFt = 15.0f;  // Altitude threshold for landing detection
-
-// BMP5xx sensor settings
-bmp5xx_oversampling_t bmpTempOversampling = BMP5XX_OVERSAMPLING_2X;
-bmp5xx_oversampling_t bmpPressOversampling = BMP5XX_OVERSAMPLING_16X;
-bmp5xx_iir_filter_t bmpIirFilterCoeff = BMP5XX_IIR_FILTER_COEFF_3;
-bmp5xx_odr_t bmpOutputDataRate = BMP5XX_ODR_100_2_HZ;
+float launchThresholdMultiplier = 5.0f;
+float burnoutThresholdMultiplier = 2.0f;
+int launchStreakRequired = 2;
+int burnoutStreakRequired = 5;
+int apogeeStreakRequired = 8;
+int landStreakRequired = 10;
+float landingAltitudeThresholdFt = 15.0f;
 
 SemaphoreHandle_t sensorSpiMutex = nullptr;
 SemaphoreHandle_t sdSpiMutex = nullptr;
@@ -127,7 +117,6 @@ struct SensorSample {
   int flightPhase;
 };
 
-// Must remain exactly 44 bytes for the ground station decoder.
 struct __attribute__((packed)) TelemetryPacket {
   float altitude;
   float vSpeed;
@@ -158,14 +147,6 @@ bool initLoRa();
 void startLogging();
 void stopLogging();
 
-// Flight Phase Detection
-// Phase Numbers:
-//   0 = IDLE  (pre-launch baseline)
-//   1 = LAUNCH
-//   2 = MOTOR BURNOUT
-//   3 = APOGEE
-//   4 = PARACHUTE DEPLOYED
-//   5 = LANDED
 
 static constexpr const char* const FLIGHT_PHASE_NAMES[] = {
     "IDLE",
@@ -291,7 +272,6 @@ private:
     }
 };
 
-// Flight phase detector global
 FlightDetector flightDetector{};
 SemaphoreHandle_t flightPhaseMutex = nullptr;
 
@@ -528,6 +508,7 @@ void setupLoggerMode() {
   pinMode(CS_ICM, OUTPUT); digitalWrite(CS_ICM, HIGH);
   pinMode(CS_BMP, OUTPUT); digitalWrite(CS_BMP, HIGH);
   pinMode(CS_MMC, OUTPUT); digitalWrite(CS_MMC, HIGH);
+  pinMode(RFM95_CS, OUTPUT); digitalWrite(RFM95_CS, HIGH);
   pinMode(CS_SD, OUTPUT); digitalWrite(CS_SD, HIGH);
 
   SPI.begin();
@@ -552,10 +533,11 @@ void setupLoggerMode() {
     setRGB(150, 0, 0);
     blinkRedForever();
   }
-  bmp.setTemperatureOversampling(bmpTempOversampling);
-  bmp.setPressureOversampling(bmpPressOversampling);
-  bmp.setIIRFilterCoeff(bmpIirFilterCoeff);
-  bmp.setOutputDataRate(bmpOutputDataRate);
+
+  bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
+  bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);
+  bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_3);
+  bmp.setOutputDataRate(BMP5XX_ODR_100_2_HZ);
   bmp.setPowerMode(BMP5XX_POWERMODE_CONTINUOUS);
 
   if (myMag.begin(CS_MMC) == false) {
@@ -942,8 +924,6 @@ void LoRaTask(void* pvParameters) {
       xSemaphoreGive(gpsDataMutex);
     }
 
-    // Quaternion and INS estimates are not available in this build yet, so they remain zero.
-    // Packet is intentionally zero-initialised to preserve the ground-station layout.
     if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
       if (LoRa.beginPacket()) {
         LoRa.write(reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
@@ -964,8 +944,6 @@ void FlightPhaseTask(void* pvParameters) {
       vTaskDelete(nullptr);
     }
 
-    // Total acceleration magnitude: IMU accel + gravity (approximated as 1g downward for simplicity)
-    // For now, use just the IMU acceleration magnitude
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
     if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
       if (IMU) IMU->getAGT();
@@ -976,19 +954,12 @@ void FlightPhaseTask(void* pvParameters) {
     }
     const float accelMag = sqrtf(ax*ax + ay*ay + az*az);
 
-    // Altitude in feet (bmpAltitude is metres)
     float altFt = 0.0f;
     float verticalSpeed = 0.0f;
     if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
-      // Read from latest sensor data captured by SensorPollTask
       xSemaphoreGive(countMutex);
     }
 
-    // For now, simplify: get altitude from latest sample
-    // In a full implementation, this would come from a shared sensor buffer
-    // For this accelerometer-based detection, use barometric data from SensorPollTask
-
-    // Barometric acceleration: d(verticalSpeed)/dt
     const unsigned long now = millis();
     float accelBaro = 0.0f;
     if (prevTimeMs > 0) {
@@ -998,11 +969,9 @@ void FlightPhaseTask(void* pvParameters) {
     prevVelMs  = verticalSpeed;
     prevTimeMs = now;
 
-    // Feed into detector
     const int transition = flightDetector.feed(accelMag, altFt, accelBaro);
 
     if (xSemaphoreTake(flightPhaseMutex, portMAX_DELAY) == pdTRUE) {
-      // Flight phase will be read by SensorPollTask
       xSemaphoreGive(flightPhaseMutex);
     }
 
