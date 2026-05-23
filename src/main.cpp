@@ -55,11 +55,36 @@ Adafruit_BMP5xx bmp;
 SFE_MMC5983MA myMag;
 SFE_UBLOX_GNSS myGNSS;
 
-static auto ap_ssid = "LIFTSv2";
-static auto ap_password = "123456789";
+String ap_ssid = "LIFTSv2";
+String ap_password = "123456789";
 WebServer webServer(80);
 
+// ===== Configuration Variables =====
 float seaLevelPressureHpa = 1013.25f;
+
+// Sensor sampling rates (ms)
+uint32_t sensorSampleRateMs = 10;      // IMU/BMP/MAG sampling rate
+uint32_t gpsSampleRateMs = 1000;       // GPS sampling rate
+uint32_t logFlushIntervalMs = 1000;    // SD card flush interval
+
+// LED brightness (0-255)
+uint8_t ledBrightnessHeartbeat = 40;
+uint8_t ledBrightnessIdle = 20;
+
+// Flight detection thresholds
+float launchThresholdMultiplier = 5.0f;    // Launch detection: baseline_accel + (N * baseline_std)
+float burnoutThresholdMultiplier = 2.0f;   // Burnout detection threshold
+int launchStreakRequired = 2;              // Consecutive samples for launch
+int burnoutStreakRequired = 5;             // Consecutive samples for burnout
+int apogeeStreakRequired = 8;              // Consecutive samples past apogee
+int landStreakRequired = 10;               // Consecutive samples for landing
+float landingAltitudeThresholdFt = 15.0f;  // Altitude threshold for landing detection
+
+// BMP5xx sensor settings
+bmp5xx_oversampling_t bmpTempOversampling = BMP5XX_OVERSAMPLING_2X;
+bmp5xx_oversampling_t bmpPressOversampling = BMP5XX_OVERSAMPLING_16X;
+bmp5xx_iir_filter_t bmpIirFilterCoeff = BMP5XX_IIR_FILTER_COEFF_3;
+bmp5xx_odr_t bmpOutputDataRate = BMP5XX_ODR_100_2_HZ;
 
 SemaphoreHandle_t sensorSpiMutex = nullptr;
 SemaphoreHandle_t sdSpiMutex = nullptr;
@@ -71,9 +96,11 @@ volatile uint32_t pollCount = 0;
 volatile bool stopSensorTask = false;
 volatile bool stopSdTask = false;
 volatile bool stopGpsTask = false;
+volatile bool stopFlightPhaseTask = false;
 volatile bool sensorTaskStopped = false;
 volatile bool sdLogTaskStopped = false;
 volatile bool gpsTaskStopped = false;
+volatile bool flightPhaseTaskStopped = false;
 
 USBMSC msc;
 sdmmc_card_t* mscCard = nullptr;
@@ -97,6 +124,7 @@ struct SensorSample {
   float bmpTemp, bmpPressure, bmpAltitude, bmpVSpeed;
   uint32_t magX, magY, magZ;
   GpsSample gps;
+  int flightPhase;
 };
 
 // Must remain exactly 44 bytes for the ground station decoder.
@@ -129,6 +157,143 @@ bool initGPS();
 bool initLoRa();
 void startLogging();
 void stopLogging();
+
+// Flight Phase Detection
+// Phase Numbers:
+//   0 = IDLE  (pre-launch baseline)
+//   1 = LAUNCH
+//   2 = MOTOR BURNOUT
+//   3 = APOGEE
+//   4 = PARACHUTE DEPLOYED
+//   5 = LANDED
+
+static constexpr const char* const FLIGHT_PHASE_NAMES[] = {
+    "IDLE",
+    "LAUNCH",
+    "MOTOR BURNOUT",
+    "APOGEE",
+    "PARACHUTE DEPLOYED",
+    "LANDED"
+};
+
+class FlightDetector {
+public:
+    static constexpr int BASELINE_N    = 30;
+    static constexpr int CHUTE_BUF_SZ  = 20;
+
+    FlightDetector()
+        : _phase(0), _blAccelSum(0.0f), _blAccelSumSq(0.0f), _blAltSum(0.0f), _blN(0),
+          _baselineDone(false), _blAccelMean(0.0f), _blAccelStd(1.0f), _blAltMean(0.0f),
+          _launchStreak(0), _burnoutStreak(0), _apogeePeak(0.0f), _apogeeStreak(0),
+          _chuteHead(0), _chuteCount(0), _chuteWarmup(0), _landStreak(0) {
+    }
+
+    void reset() {
+        _phase        = 0;
+        _blAccelSum   = 0.0f; _blAccelSumSq = 0.0f; _blAltSum = 0.0f; _blN = 0;
+        _baselineDone = false;
+        _blAccelMean  = 0.0f; _blAccelStd = 1.0f; _blAltMean = 0.0f;
+        _launchStreak = 0; _burnoutStreak = 0;
+        _apogeePeak   = 0.0f; _apogeeStreak = 0;
+        for (auto& val : _chuteBuf) val = 0.0f;
+        _chuteHead = 0; _chuteCount = 0; _chuteWarmup = 0;
+        _landStreak = 0;
+    }
+
+    int feed(float accel_mag, float alt_ft, float accel_baro) {
+        const int prev = _phase;
+
+        if (!_baselineDone) {
+            if (_blN >= 3) {
+                const float runningMean = _blAccelSum / static_cast<float>(_blN);
+                if (accel_mag > runningMean * 5.0f) {
+                    _finaliseBaseline();
+                } else {
+                    _accumulate(accel_mag, alt_ft);
+                    if (_blN >= BASELINE_N) _finaliseBaseline();
+                    return -1;
+                }
+            } else {
+                _accumulate(accel_mag, alt_ft);
+                return -1;
+            }
+        }
+
+        if (_phase == 0) {
+            const float thresh = _blAccelMean + launchThresholdMultiplier * _blAccelStd;
+            _launchStreak = (accel_mag > thresh) ? (_launchStreak + 1) : 0;
+            if (_launchStreak >= launchStreakRequired) _phase = 1;
+        }
+        else if (_phase == 1) {
+            const float thresh = _blAccelMean + burnoutThresholdMultiplier * _blAccelStd;
+            _burnoutStreak = (accel_mag < thresh) ? (_burnoutStreak + 1) : 0;
+            if (_burnoutStreak >= burnoutStreakRequired) _phase = 2;
+        }
+        else if (_phase == 2) {
+            if (alt_ft >= _apogeePeak) { _apogeePeak = alt_ft; _apogeeStreak = 0; }
+            else                       { _apogeeStreak++; }
+            if (_apogeeStreak >= apogeeStreakRequired) _phase = 3;
+        }
+        else if (_phase == 3) {
+            _chuteBuf[_chuteHead] = accel_baro;
+            _chuteHead = (_chuteHead + 1) % CHUTE_BUF_SZ;
+            if (_chuteCount < CHUTE_BUF_SZ) _chuteCount++;
+            _chuteWarmup++;
+
+            if (_chuteWarmup >= 15 && _chuteCount >= 15) {
+                float mean = 0.0f;
+                for (int i = 0; i < _chuteCount; ++i) mean += _chuteBuf[i];
+                mean /= static_cast<float>(_chuteCount);
+                float var = 0.0f;
+                for (int i = 0; i < _chuteCount; ++i) {
+                    const float d = _chuteBuf[i] - mean;
+                    var += d * d;
+                }
+                const float sd = sqrtf(var / static_cast<float>(_chuteCount));
+                const float eff = (sd > 1.0f) ? sd : 1.0f;
+                if (fabsf(accel_baro - mean) > 4.0f * eff) _phase = 4;
+            }
+        }
+        else if (_phase == 4) {
+            _landStreak = (fabsf(alt_ft - _blAltMean) < landingAltitudeThresholdFt) ? (_landStreak + 1) : 0;
+            if (_landStreak >= landStreakRequired) _phase = 5;
+        }
+
+        return (_phase != prev) ? _phase : -1;
+    }
+
+    int phase() const { return _phase; }
+
+private:
+    int   _phase;
+    float _blAccelSum, _blAccelSumSq, _blAltSum;
+    int   _blN;
+    bool  _baselineDone;
+    float _blAccelMean, _blAccelStd, _blAltMean;
+    int   _launchStreak, _burnoutStreak;
+    float _apogeePeak;
+    int   _apogeeStreak;
+    float _chuteBuf[CHUTE_BUF_SZ];
+    int   _chuteHead, _chuteCount, _chuteWarmup;
+    int   _landStreak;
+
+    void _accumulate(float am, float af) {
+        _blAccelSum += am; _blAccelSumSq += am * am; _blAltSum += af; _blN++;
+    }
+    void _finaliseBaseline() {
+        _blAccelMean = _blAccelSum / static_cast<float>(_blN);
+        float var    = (_blAccelSumSq / static_cast<float>(_blN)) - (_blAccelMean * _blAccelMean);
+        if (var < 0.0f) var = 0.0f;
+        const float sd = sqrtf(var);
+        _blAccelStd  = (sd > 0.5f) ? sd : 0.5f;
+        _blAltMean   = _blAltSum / static_cast<float>(_blN);
+        _baselineDone = true;
+    }
+};
+
+// Flight phase detector global
+FlightDetector flightDetector{};
+SemaphoreHandle_t flightPhaseMutex = nullptr;
 
 namespace {
 
@@ -172,6 +337,7 @@ void SensorPollTask(void* pvParameters);
 void SdLogTask(void* pvParameters);
 void GpsTask(void* pvParameters);
 void LoRaTask(void* pvParameters);
+void FlightPhaseTask(void* pvParameters);
 void PrintTask(void* pvParameters);
 void ControlTask(void* pvParameters);
 void setupLoggerMode();
@@ -187,7 +353,6 @@ void handleNotFound();
 
 void saveConfiguration();
 void loadConfiguration();
-bool parsePressureFromBody(const String& body, float& outPressure);
 
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   analogWrite(RED_LED, r);
@@ -197,7 +362,7 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
 
 void ledHeartbeat() {
   unsigned long t = millis() % 2000;
-  unsigned long brightness_ul = (t < 1000UL) ? (t * 40UL / 1000UL) : ((2000UL - t) * 40UL / 1000UL);
+  unsigned long brightness_ul = (t < 1000UL) ? (t * static_cast<unsigned long>(ledBrightnessHeartbeat) / 1000UL) : ((2000UL - t) * static_cast<unsigned long>(ledBrightnessHeartbeat) / 1000UL);
   setRGB(0, static_cast<uint8_t>(brightness_ul), 0);
 }
 
@@ -387,10 +552,10 @@ void setupLoggerMode() {
     setRGB(150, 0, 0);
     blinkRedForever();
   }
-  bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
-  bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);
-  bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_3);
-  bmp.setOutputDataRate(BMP5XX_ODR_100_2_HZ);
+  bmp.setTemperatureOversampling(bmpTempOversampling);
+  bmp.setPressureOversampling(bmpPressOversampling);
+  bmp.setIIRFilterCoeff(bmpIirFilterCoeff);
+  bmp.setOutputDataRate(bmpOutputDataRate);
   bmp.setPowerMode(BMP5XX_POWERMODE_CONTINUOUS);
 
   if (myMag.begin(CS_MMC) == false) {
@@ -421,7 +586,8 @@ void setupLoggerMode() {
   countMutex = xSemaphoreCreateMutex();
   gpsDataMutex = xSemaphoreCreateMutex();
   telemetryMutex = xSemaphoreCreateMutex();
-  if (!sensorSpiMutex || !sdSpiMutex || !countMutex || !gpsDataMutex || !telemetryMutex) {
+  flightPhaseMutex = xSemaphoreCreateMutex();
+  if (!sensorSpiMutex || !sdSpiMutex || !countMutex || !gpsDataMutex || !telemetryMutex || !flightPhaseMutex) {
     Serial.println("Failed to create mutexes");
     setRGB(150, 0, 0);
     while (true) delay(10);
@@ -484,7 +650,7 @@ void startLogging() {
     return;
   }
 
-  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading");
+  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading,flightPhase");
   logFile.flush();
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
@@ -504,15 +670,18 @@ void startLogging() {
   stopSensorTask = false;
   stopSdTask = false;
   stopGpsTask = false;
+  stopFlightPhaseTask = false;
   sensorTaskStopped = false;
   sdLogTaskStopped = false;
   gpsTaskStopped = false;
+  flightPhaseTaskStopped = false;
 
   BaseType_t r0 = xTaskCreate(GpsTask, "GpsPoll", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   BaseType_t r1 = xTaskCreate(SensorPollTask, "SensorPoll", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr);
   BaseType_t r3 = xTaskCreate(SdLogTask, "SDLog", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  BaseType_t r4 = xTaskCreate(FlightPhaseTask, "FlightPhase", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
-  if (r0 != pdPASS || r1 != pdPASS || r3 != pdPASS) {
+  if (r0 != pdPASS || r1 != pdPASS || r3 != pdPASS || r4 != pdPASS) {
     Serial.println("Failed to create FreeRTOS tasks");
     setRGB(150, 0, 0);
     return;
@@ -534,6 +703,10 @@ void stopLogging() {
   stopGpsTask = true;
   t0 = millis();
   while (!gpsTaskStopped && (millis() - t0) < 3000) delay(10);
+
+  stopFlightPhaseTask = true;
+  t0 = millis();
+  while (!flightPhaseTaskStopped && (millis() - t0) < 1000) delay(10);
 
   stopSdTask = true;
   t0 = millis();
@@ -624,7 +797,7 @@ void ControlTask(void* pvParameters) {
     if (inMSCMode) {
       setRGB(0, 0, 80);
     } else {
-      if (loggingActive) ledHeartbeat(); else setRGB(0, 20, 0);
+      if (loggingActive) ledHeartbeat(); else setRGB(0, ledBrightnessIdle, 0);
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -632,7 +805,7 @@ void ControlTask(void* pvParameters) {
 }
 
 void SensorPollTask(void* pvParameters) {
-  constexpr TickType_t xFrequency = pdMS_TO_TICKS(10);
+  TickType_t xFrequency = pdMS_TO_TICKS(sensorSampleRateMs);
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   for (;;) {
@@ -688,6 +861,11 @@ void SensorPollTask(void* pvParameters) {
       xSemaphoreGive(telemetryMutex);
     }
 
+    if (xSemaphoreTake(flightPhaseMutex, portMAX_DELAY) == pdTRUE) {
+      sample.flightPhase = flightDetector.phase();
+      xSemaphoreGive(flightPhaseMutex);
+    }
+
     if (logQueue != nullptr) {
       xQueueSend(logQueue, &sample, pdMS_TO_TICKS(50));
     }
@@ -700,7 +878,7 @@ void SensorPollTask(void* pvParameters) {
 }
 
 void GpsTask(void* pvParameters) {
-  constexpr TickType_t xFrequency = pdMS_TO_TICKS(1000);
+  TickType_t xFrequency = pdMS_TO_TICKS(gpsSampleRateMs);
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   for (;;) {
@@ -776,6 +954,67 @@ void LoRaTask(void* pvParameters) {
   }
 }
 
+void FlightPhaseTask(void* pvParameters) {
+  float prevVelMs  = 0.0f;
+  unsigned long prevTimeMs = 0;
+
+  for (;;) {
+    if (stopFlightPhaseTask) {
+      flightPhaseTaskStopped = true;
+      vTaskDelete(nullptr);
+    }
+
+    // Total acceleration magnitude: IMU accel + gravity (approximated as 1g downward for simplicity)
+    // For now, use just the IMU acceleration magnitude
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    if (xSemaphoreTake(sensorSpiMutex, portMAX_DELAY) == pdTRUE) {
+      if (IMU) IMU->getAGT();
+      ax = IMU ? readImuAccelX(*IMU) : 0.0f;
+      ay = IMU ? readImuAccelY(*IMU) : 0.0f;
+      az = IMU ? readImuAccelZ(*IMU) : 0.0f;
+      xSemaphoreGive(sensorSpiMutex);
+    }
+    const float accelMag = sqrtf(ax*ax + ay*ay + az*az);
+
+    // Altitude in feet (bmpAltitude is metres)
+    float altFt = 0.0f;
+    float verticalSpeed = 0.0f;
+    if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
+      // Read from latest sensor data captured by SensorPollTask
+      xSemaphoreGive(countMutex);
+    }
+
+    // For now, simplify: get altitude from latest sample
+    // In a full implementation, this would come from a shared sensor buffer
+    // For this accelerometer-based detection, use barometric data from SensorPollTask
+
+    // Barometric acceleration: d(verticalSpeed)/dt
+    const unsigned long now = millis();
+    float accelBaro = 0.0f;
+    if (prevTimeMs > 0) {
+      const float dt = static_cast<float>(now - prevTimeMs) / 1000.0f;
+      if (dt > 0.0f) accelBaro = (verticalSpeed - prevVelMs) / dt;
+    }
+    prevVelMs  = verticalSpeed;
+    prevTimeMs = now;
+
+    // Feed into detector
+    const int transition = flightDetector.feed(accelMag, altFt, accelBaro);
+
+    if (xSemaphoreTake(flightPhaseMutex, portMAX_DELAY) == pdTRUE) {
+      // Flight phase will be read by SensorPollTask
+      xSemaphoreGive(flightPhaseMutex);
+    }
+
+    if (transition >= 0) {
+      Serial.printf("[FLIGHT PHASE] %d: %s\n",
+                    transition, FLIGHT_PHASE_NAMES[transition]);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
 void SdLogTask(void* pvParameters) {
   TickType_t lastFlush = xTaskGetTickCount();
   SensorSample sample{};
@@ -802,7 +1041,8 @@ void SdLogTask(void* pvParameters) {
     logFile.print(sample.gps.longitude, 7);      logFile.print(',');
     logFile.print(sample.gps.altitude, 3);       logFile.print(',');
     logFile.print(sample.gps.speed, 3);          logFile.print(',');
-    logFile.println(sample.gps.heading, 3);
+    logFile.print(sample.gps.heading, 3);        logFile.print(',');
+    logFile.println(sample.flightPhase);
   };
 
   for (;;) {
@@ -831,7 +1071,7 @@ void SdLogTask(void* pvParameters) {
       } while (xQueueReceive(logQueue, &sample, 0) == pdTRUE);
     }
 
-    if ((xTaskGetTickCount() - lastFlush) >= pdMS_TO_TICKS(1000)) {
+    if ((xTaskGetTickCount() - lastFlush) >= pdMS_TO_TICKS(logFlushIntervalMs)) {
       if (xSemaphoreTake(sdSpiMutex, portMAX_DELAY) == pdTRUE) {
         logFile.flush();
         xSemaphoreGive(sdSpiMutex);
@@ -924,6 +1164,21 @@ void handleFileDownload() {
 void handleGetConfig() {
   JsonDocument doc;
   doc["pressure"] = String(seaLevelPressureHpa, 2);
+  doc["sensorSampleRateMs"] = sensorSampleRateMs;
+  doc["gpsSampleRateMs"] = gpsSampleRateMs;
+  doc["logFlushIntervalMs"] = logFlushIntervalMs;
+  doc["ledBrightnessHeartbeat"] = ledBrightnessHeartbeat;
+  doc["ledBrightnessIdle"] = ledBrightnessIdle;
+  doc["launchThresholdMultiplier"] = String(launchThresholdMultiplier, 2);
+  doc["burnoutThresholdMultiplier"] = String(burnoutThresholdMultiplier, 2);
+  doc["launchStreakRequired"] = launchStreakRequired;
+  doc["burnoutStreakRequired"] = burnoutStreakRequired;
+  doc["apogeeStreakRequired"] = apogeeStreakRequired;
+  doc["landStreakRequired"] = landStreakRequired;
+  doc["landingAltitudeThresholdFt"] = String(landingAltitudeThresholdFt, 2);
+  doc["wifiSSID"] = ap_ssid;
+  doc["wifiPassword"] = ap_password;
+
   String output;
   serializeJson(doc, output);
   webServer.send(200, "application/json", output);
@@ -936,12 +1191,72 @@ void handleUpdateConfig() {
     webServer.send(400, "text/plain", "Empty body");
     return;
   }
-  float newPressure = NAN;
-  if (!parsePressureFromBody(body, newPressure) || newPressure < 800.0f || newPressure > 1200.0f) {
-    webServer.send(400, "text/plain", "Invalid pressure value");
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+  if (error) {
+    webServer.send(400, "text/plain", "Invalid JSON");
     return;
   }
-  seaLevelPressureHpa = newPressure;
+
+   if (doc["pressure"].is<float>()) {
+     float p = doc["pressure"].as<float>();
+     if (p >= 800.0f && p <= 1200.0f) seaLevelPressureHpa = p;
+     else { webServer.send(400, "text/plain", "Invalid pressure value"); return; }
+   }
+   if (doc["sensorSampleRateMs"].is<uint32_t>()) {
+     uint32_t val = doc["sensorSampleRateMs"].as<uint32_t>();
+     if (val >= 5 && val <= 10000) sensorSampleRateMs = val;
+   }
+   if (doc["gpsSampleRateMs"].is<uint32_t>()) {
+     uint32_t val = doc["gpsSampleRateMs"].as<uint32_t>();
+     if (val >= 100 && val <= 60000) gpsSampleRateMs = val;
+   }
+   if (doc["logFlushIntervalMs"].is<uint32_t>()) {
+     uint32_t val = doc["logFlushIntervalMs"].as<uint32_t>();
+     if (val >= 500 && val <= 60000) logFlushIntervalMs = val;
+   }
+   if (doc["ledBrightnessHeartbeat"].is<uint8_t>()) {
+     ledBrightnessHeartbeat = doc["ledBrightnessHeartbeat"].as<uint8_t>();
+   }
+   if (doc["ledBrightnessIdle"].is<uint8_t>()) {
+     ledBrightnessIdle = doc["ledBrightnessIdle"].as<uint8_t>();
+   }
+   if (doc["launchThresholdMultiplier"].is<float>()) {
+     float val = doc["launchThresholdMultiplier"].as<float>();
+     if (val >= 1.0f && val <= 20.0f) launchThresholdMultiplier = val;
+   }
+   if (doc["burnoutThresholdMultiplier"].is<float>()) {
+     float val = doc["burnoutThresholdMultiplier"].as<float>();
+     if (val >= 0.5f && val <= 10.0f) burnoutThresholdMultiplier = val;
+   }
+   if (doc["launchStreakRequired"].is<int>()) {
+     int val = doc["launchStreakRequired"].as<int>();
+     if (val >= 1 && val <= 50) launchStreakRequired = val;
+   }
+   if (doc["burnoutStreakRequired"].is<int>()) {
+     int val = doc["burnoutStreakRequired"].as<int>();
+     if (val >= 1 && val <= 100) burnoutStreakRequired = val;
+   }
+   if (doc["apogeeStreakRequired"].is<int>()) {
+     int val = doc["apogeeStreakRequired"].as<int>();
+     if (val >= 1 && val <= 100) apogeeStreakRequired = val;
+   }
+   if (doc["landStreakRequired"].is<int>()) {
+     int val = doc["landStreakRequired"].as<int>();
+     if (val >= 1 && val <= 100) landStreakRequired = val;
+   }
+   if (doc["landingAltitudeThresholdFt"].is<float>()) {
+     float val = doc["landingAltitudeThresholdFt"].as<float>();
+     if (val >= 1.0f && val <= 500.0f) landingAltitudeThresholdFt = val;
+   }
+   if (doc["wifiSSID"].is<String>()) {
+     ap_ssid = doc["wifiSSID"].as<String>();
+   }
+   if (doc["wifiPassword"].is<String>()) {
+     ap_password = doc["wifiPassword"].as<String>();
+   }
+
   saveConfiguration();
   webServer.send(200, "text/plain", "Config updated");
 }
@@ -953,58 +1268,131 @@ void handleNotFound() {
 void saveConfiguration() {
   File f = SD.open("/config.txt", FILE_WRITE);
   if (!f) return;
+
   f.print("pressure=");
   f.println(String(seaLevelPressureHpa, 2));
+
+  f.print("sensorSampleRateMs=");
+  f.println(sensorSampleRateMs);
+
+  f.print("gpsSampleRateMs=");
+  f.println(gpsSampleRateMs);
+
+  f.print("logFlushIntervalMs=");
+  f.println(logFlushIntervalMs);
+
+  f.print("ledBrightnessHeartbeat=");
+  f.println(ledBrightnessHeartbeat);
+
+  f.print("ledBrightnessIdle=");
+  f.println(ledBrightnessIdle);
+
+  f.print("launchThresholdMultiplier=");
+  f.println(String(launchThresholdMultiplier, 2));
+
+  f.print("burnoutThresholdMultiplier=");
+  f.println(String(burnoutThresholdMultiplier, 2));
+
+  f.print("launchStreakRequired=");
+  f.println(launchStreakRequired);
+
+  f.print("burnoutStreakRequired=");
+  f.println(burnoutStreakRequired);
+
+  f.print("apogeeStreakRequired=");
+  f.println(apogeeStreakRequired);
+
+  f.print("landStreakRequired=");
+  f.println(landStreakRequired);
+
+  f.print("landingAltitudeThresholdFt=");
+  f.println(String(landingAltitudeThresholdFt, 2));
+
+  f.print("wifiSSID=");
+  f.println(ap_ssid);
+
+  f.print("wifiPassword=");
+  f.println(ap_password);
+
   f.close();
 }
 
 void loadConfiguration() {
   File f = SD.open("/config.txt");
   if (!f) {
-    Serial.println("config.txt not found on SD (using default sea level pressure). Creating default.");
+    Serial.println("config.txt not found on SD (using defaults). Creating default.");
     saveConfiguration();
     return;
   }
+
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
+
     if (line.startsWith("pressure=")) {
       String val = line.substring(line.indexOf('=') + 1);
       float p = val.toFloat();
-      if (p >= 800.0f && p <= 1200.0f) {
-        seaLevelPressureHpa = p;
-      }
+      if (p >= 800.0f && p <= 1200.0f) seaLevelPressureHpa = p;
+    }
+    else if (line.startsWith("sensorSampleRateMs=")) {
+      sensorSampleRateMs = line.substring(line.indexOf('=') + 1).toInt();
+      if (sensorSampleRateMs < 5) sensorSampleRateMs = 5;
+    }
+    else if (line.startsWith("gpsSampleRateMs=")) {
+      gpsSampleRateMs = line.substring(line.indexOf('=') + 1).toInt();
+      if (gpsSampleRateMs < 100) gpsSampleRateMs = 100;
+    }
+    else if (line.startsWith("logFlushIntervalMs=")) {
+      logFlushIntervalMs = line.substring(line.indexOf('=') + 1).toInt();
+      if (logFlushIntervalMs < 500) logFlushIntervalMs = 500;
+    }
+    else if (line.startsWith("ledBrightnessHeartbeat=")) {
+      ledBrightnessHeartbeat = line.substring(line.indexOf('=') + 1).toInt();
+    }
+    else if (line.startsWith("ledBrightnessIdle=")) {
+      ledBrightnessIdle = line.substring(line.indexOf('=') + 1).toInt();
+    }
+    else if (line.startsWith("launchThresholdMultiplier=")) {
+      launchThresholdMultiplier = line.substring(line.indexOf('=') + 1).toFloat();
+      if (launchThresholdMultiplier < 1.0f) launchThresholdMultiplier = 1.0f;
+    }
+    else if (line.startsWith("burnoutThresholdMultiplier=")) {
+      burnoutThresholdMultiplier = line.substring(line.indexOf('=') + 1).toFloat();
+      if (burnoutThresholdMultiplier < 0.5f) burnoutThresholdMultiplier = 0.5f;
+    }
+    else if (line.startsWith("launchStreakRequired=")) {
+      launchStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (launchStreakRequired < 1) launchStreakRequired = 1;
+    }
+    else if (line.startsWith("burnoutStreakRequired=")) {
+      burnoutStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (burnoutStreakRequired < 1) burnoutStreakRequired = 1;
+    }
+    else if (line.startsWith("apogeeStreakRequired=")) {
+      apogeeStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (apogeeStreakRequired < 1) apogeeStreakRequired = 1;
+    }
+    else if (line.startsWith("landStreakRequired=")) {
+      landStreakRequired = line.substring(line.indexOf('=') + 1).toInt();
+      if (landStreakRequired < 1) landStreakRequired = 1;
+    }
+    else if (line.startsWith("landingAltitudeThresholdFt=")) {
+      landingAltitudeThresholdFt = line.substring(line.indexOf('=') + 1).toFloat();
+      if (landingAltitudeThresholdFt < 1.0f) landingAltitudeThresholdFt = 1.0f;
+    }
+    else if (line.startsWith("wifiSSID=")) {
+      ap_ssid = line.substring(line.indexOf('=') + 1);
+    }
+    else if (line.startsWith("wifiPassword=")) {
+      ap_password = line.substring(line.indexOf('=') + 1);
     }
   }
+
   f.close();
-  Serial.printf("Loaded sea level pressure: %.2f hPa\n", static_cast<double>(seaLevelPressureHpa));
+  Serial.printf("Loaded configuration: pressure=%.2f hPa, sensorRate=%lu ms, gpsRate=%lu ms\n",
+                static_cast<double>(seaLevelPressureHpa),
+                static_cast<unsigned long>(sensorSampleRateMs),
+                static_cast<unsigned long>(gpsSampleRateMs));
 }
 
-bool parsePressureFromBody(const String& body, float& outPressure) {
-  String s = body;
-  s.trim();
-
-  int keyPos = s.indexOf("pressure");
-  if (keyPos >= 0) {
-    int sep = s.indexOf('=', keyPos);
-    if (sep < 0) sep = s.indexOf(':', keyPos);
-    if (sep >= 0) {
-      String num = s.substring(sep + 1);
-      num.trim();
-      if (num.startsWith("\"")) num.remove(0, 1);
-      if (num.endsWith("\"")) num.remove(num.length() - 1);
-      while (num.length() > 0) {
-        const char c = num.charAt(num.length() - 1);
-        const bool numericTail = (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
-        if (numericTail) break;
-        num.remove(num.length() - 1);
-      }
-      outPressure = num.toFloat();
-      return !isnan(outPressure);
-    }
-  }
-
-  outPressure = s.toFloat();
-  return !isnan(outPressure);
-}
 

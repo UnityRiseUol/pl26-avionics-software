@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LIFTS v2 Flight Controller</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .container {
+            background: #fff;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            width: 100%;
+            max-width: 800px;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 0.9em;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #eee;
+        }
+        .tab-btn {
+            padding: 12px 20px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-size: 1em;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s;
+        }
+        .tab-btn.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+        .tab-btn:hover {
+            color: #667eea;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .section {
+            margin-bottom: 25px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #f9f9f9;
+        }
+        .section h3 {
+            margin-bottom: 15px;
+            color: #333;
+            font-size: 1.1em;
+        }
+        .form-group {
+            margin-bottom: 15px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            align-items: center;
+        }
+        .form-group.full {
+            grid-template-columns: 1fr;
+        }
+        label {
+            font-weight: 600;
+            color: #333;
+            font-size: 0.95em;
+        }
+        input[type="number"],
+        input[type="text"] {
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            font-size: 0.95em;
+            transition: border-color 0.3s;
+        }
+        input[type="number"]:focus,
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 5px rgba(102, 126, 234, 0.2);
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 20px;
+        }
+        button {
+            background-color: #667eea;
+            color: white;
+            padding: 12px 25px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #764ba2;
+        }
+        button.secondary {
+            background-color: #6c757d;
+        }
+        button.secondary:hover {
+            background-color: #5a6268;
+        }
+        #statusMessage {
+            margin-top: 20px;
+            text-align: center;
+            font-weight: 600;
+            padding: 12px;
+            border-radius: 6px;
+            display: none;
+        }
+        #statusMessage.show {
+            display: block;
+        }
+        #statusMessage.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        #statusMessage.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        #statusMessage.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        #file-list {
+            list-style-type: none;
+            padding: 0;
+        }
+        #file-list li {
+            background: white;
+            margin: 8px 0;
+            padding: 12px;
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #ddd;
+            transition: box-shadow 0.3s;
+        }
+        #file-list li:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        #file-list a {
+            text-decoration: none;
+            color: white;
+            background-color: #667eea;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            font-weight: 600;
+            transition: background-color 0.3s;
+        }
+        #file-list a:hover {
+            background-color: #764ba2;
+        }
+        .info-box {
+            background: #e7f3ff;
+            border-left: 4px solid #667eea;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 0.9em;
+            color: #004085;
+        }
+        .setting-description {
+            font-size: 0.85em;
+            color: #666;
+            margin-top: 3px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🚀 LIFTS v2</h1>
+    <p class="subtitle">Advanced Rocket Flight Data Logger & Avionics Controller</p>
+
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('config')">Configuration</button>
+        <button class="tab-btn" onclick="switchTab('files')">Data Logs</button>
+    </div>
+
+    <!-- Configuration Tab -->
+    <div id="config" class="tab-content active">
+        <div class="info-box">
+            💡 Modify flight controller settings below. All changes are saved to the SD card and will persist after reboot.
+        </div>
+
+        <form id="configForm">
+            <!-- Sensor Settings -->
+            <div class="section">
+                <h3>📊 Sensor Configuration</h3>
+                <div class="form-group">
+                    <div>
+                        <label for="pressure">Sea Level Pressure (hPa):</label>
+                        <div class="setting-description">Range: 800-1200 hPa</div>
+                    </div>
+                    <input type="number" id="pressure" name="pressure" step="0.01" min="800" max="1200" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="sensorSampleRateMs">Sensor Sample Rate (ms):</label>
+                        <div class="setting-description">IMU/BMP/MAG sampling interval. Range: 5-10000 ms</div>
+                    </div>
+                    <input type="number" id="sensorSampleRateMs" name="sensorSampleRateMs" min="5" max="10000" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="gpsSampleRateMs">GPS Sample Rate (ms):</label>
+                        <div class="setting-description">Range: 100-60000 ms</div>
+                    </div>
+                    <input type="number" id="gpsSampleRateMs" name="gpsSampleRateMs" min="100" max="60000" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="logFlushIntervalMs">SD Log Flush Interval (ms):</label>
+                        <div class="setting-description">Range: 500-60000 ms</div>
+                    </div>
+                    <input type="number" id="logFlushIntervalMs" name="logFlushIntervalMs" min="500" max="60000" required>
+                </div>
+            </div>
+
+            <!-- LED Settings -->
+            <div class="section">
+                <h3>💡 LED Configuration</h3>
+                <div class="form-group">
+                    <div>
+                        <label for="ledBrightnessHeartbeat">Heartbeat LED Brightness (0-255):</label>
+                        <div class="setting-description">Brightness during active logging</div>
+                    </div>
+                    <input type="number" id="ledBrightnessHeartbeat" name="ledBrightnessHeartbeat" min="0" max="255" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="ledBrightnessIdle">Idle LED Brightness (0-255):</label>
+                        <div class="setting-description">Brightness when waiting for flight</div>
+                    </div>
+                    <input type="number" id="ledBrightnessIdle" name="ledBrightnessIdle" min="0" max="255" required>
+                </div>
+            </div>
+
+            <!-- Flight Detection Settings -->
+            <div class="section">
+                <h3>🎯 Flight Detection Thresholds</h3>
+                <div class="form-group">
+                    <div>
+                        <label for="launchThresholdMultiplier">Launch Threshold Multiplier:</label>
+                        <div class="setting-description">Baseline accel + (N × baseline std). Range: 1-20</div>
+                    </div>
+                    <input type="number" id="launchThresholdMultiplier" name="launchThresholdMultiplier" step="0.01" min="1" max="20" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="burnoutThresholdMultiplier">Burnout Threshold Multiplier:</label>
+                        <div class="setting-description">Range: 0.5-10</div>
+                    </div>
+                    <input type="number" id="burnoutThresholdMultiplier" name="burnoutThresholdMultiplier" step="0.01" min="0.5" max="10" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="launchStreakRequired">Launch Streak Required (samples):</label>
+                        <div class="setting-description">Consecutive samples above threshold. Range: 1-50</div>
+                    </div>
+                    <input type="number" id="launchStreakRequired" name="launchStreakRequired" min="1" max="50" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="burnoutStreakRequired">Burnout Streak Required (samples):</label>
+                        <div class="setting-description">Range: 1-100</div>
+                    </div>
+                    <input type="number" id="burnoutStreakRequired" name="burnoutStreakRequired" min="1" max="100" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="apogeeStreakRequired">Apogee Streak Required (samples):</label>
+                        <div class="setting-description">Consecutive samples past peak altitude. Range: 1-100</div>
+                    </div>
+                    <input type="number" id="apogeeStreakRequired" name="apogeeStreakRequired" min="1" max="100" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="landStreakRequired">Landing Streak Required (samples):</label>
+                        <div class="setting-description">Consecutive samples near ground. Range: 1-100</div>
+                    </div>
+                    <input type="number" id="landStreakRequired" name="landStreakRequired" min="1" max="100" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="landingAltitudeThresholdFt">Landing Altitude Threshold (ft):</label>
+                        <div class="setting-description">Altitude considered "landed". Range: 1-500 ft</div>
+                    </div>
+                    <input type="number" id="landingAltitudeThresholdFt" name="landingAltitudeThresholdFt" step="0.1" min="1" max="500" required>
+                </div>
+            </div>
+
+            <!-- WiFi Settings -->
+            <div class="section">
+                <h3>📡 WiFi Configuration</h3>
+                <div class="form-group full">
+                    <div>
+                        <label for="wifiSSID">WiFi SSID:</label>
+                        <div class="setting-description">AP name for connection</div>
+                    </div>
+                    <input type="text" id="wifiSSID" name="wifiSSID" required>
+                </div>
+                <div class="form-group full">
+                    <div>
+                        <label for="wifiPassword">WiFi Password:</label>
+                        <div class="setting-description">AP password for connection</div>
+                    </div>
+                    <input type="text" id="wifiPassword" name="wifiPassword" required>
+                </div>
+            </div>
+
+            <div class="button-group">
+                <button type="submit">💾 Save All Settings</button>
+                <button type="button" class="secondary" onclick="reloadSettings()">🔄 Reload Settings</button>
+            </div>
+            <div id="statusMessage"></div>
+        </form>
+    </div>
+
+    <!-- Data Logs Tab -->
+    <div id="files" class="tab-content">
+        <div class="section">
+            <h3>📁 Flight Data Logs (.csv)</h3>
+            <div class="button-group" style="margin-bottom: 15px;">
+                <button onclick="fetchCsvFiles()">🔄 Refresh List</button>
+            </div>
+            <ul id="file-list">
+                <li>Loading...</li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Tab switching functionality
+    function switchTab(tabName) {
+        const contents = document.querySelectorAll('.tab-content');
+        const buttons = document.querySelectorAll('.tab-btn');
+
+        contents.forEach(content => content.classList.remove('active'));
+        buttons.forEach(btn => btn.classList.remove('active'));
+
+        document.getElementById(tabName).classList.add('active');
+        event.target.classList.add('active');
+    }
+
+    // Status message display
+    function showStatus(message, type = 'info') {
+        const statusDiv = document.getElementById('statusMessage');
+        statusDiv.textContent = message;
+        statusDiv.className = `show ${type}`;
+        if (type === 'success') {
+            setTimeout(() => statusDiv.classList.remove('show'), 4000);
+        }
+    }
+
+    // Fetch current configuration from the device
+    async function fetchConfig() {
+        try {
+            const response = await fetch('/getconfig');
+            if (!response.ok) {
+                throw new Error(`HTTP error! Status: ${response.status}`);
+            }
+            const config = await response.json();
+
+            // Populate form with fetched values
+            Object.keys(config).forEach(key => {
+                const input = document.getElementById(key);
+                if (input) {
+                    input.value = config[key];
+                }
+            });
+
+            showStatus('✓ Configuration loaded successfully', 'success');
+        } catch (error) {
+            console.error('Failed to fetch config:', error);
+            showStatus('✗ Error loading configuration', 'error');
+        }
+    }
+
+    // Reload settings
+    function reloadSettings() {
+        fetchConfig();
+    }
+
+    // Update configuration on the device
+    async function updateConfig(event) {
+        event.preventDefault();
+
+        const formData = new FormData(document.getElementById('configForm'));
+        const newConfig = {};
+
+        // Convert form data to proper types
+        for (let [key, value] of formData.entries()) {
+            if (key === 'wifiSSID' || key === 'wifiPassword') {
+                newConfig[key] = value;
+            } else if (key === 'launchThresholdMultiplier' || key === 'burnoutThresholdMultiplier' || key === 'pressure' || key === 'landingAltitudeThresholdFt') {
+                newConfig[key] = parseFloat(value);
+            } else {
+                newConfig[key] = parseInt(value);
+            }
+        }
+
+        showStatus('Saving configuration...', 'info');
+
+        try {
+            const response = await fetch('/updateconfig', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(newConfig)
+            });
+
+            const responseText = await response.text();
+            if (!response.ok) {
+                throw new Error(responseText);
+            }
+
+            showStatus('✓ Configuration saved successfully!', 'success');
+        } catch (error) {
+            console.error('Failed to update config:', error);
+            showStatus(`✗ Error: ${error.message}`, 'error');
+        }
+    }
+
+    // Fetch and display CSV files
+    async function fetchCsvFiles() {
+        const fileList = document.getElementById('file-list');
+        fileList.innerHTML = '<li>Loading files...</li>';
+
+        try {
+            const response = await fetch('/list-csv');
+            const files = await response.json();
+
+            fileList.innerHTML = '';
+            if (files.length === 0) {
+                fileList.innerHTML = '<li>No log files found yet. Start logging to generate data files.</li>';
+            } else {
+                files.forEach(file => {
+                    const listItem = document.createElement('li');
+                    listItem.innerHTML = `<span>📄 ${file}</span> <a href="/download?file=${file}" download>⬇️ Download</a>`;
+                    fileList.appendChild(listItem);
+                });
+            }
+        } catch (error) {
+            console.error('Failed to fetch file list:', error);
+            fileList.innerHTML = '<li>Error loading file list.</li>';
+        }
+    }
+
+    // Event listeners
+    document.getElementById('configForm').addEventListener('submit', updateConfig);
+
+    // Load data on page load
+    document.addEventListener('DOMContentLoaded', () => {
+        fetchConfig();
+        fetchCsvFiles();
+    });
+</script>
+
+</body>
+</html>
+
