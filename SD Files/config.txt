@@ -1,0 +1,16 @@
+pressure=1013.25
+sensorSampleRateMs=10
+gpsSampleRateMs=1000
+logFlushIntervalMs=1000
+ledBrightnessHeartbeat=40
+ledBrightnessIdle=20
+launchThresholdMultiplier=5.00
+burnoutThresholdMultiplier=2.00
+launchStreakRequired=2
+burnoutStreakRequired=5
+apogeeStreakRequired=8
+landStreakRequired=10
+landingAltitudeThresholdFt=15.00
+wifiSSID=LIFTSv2
+wifiPassword=123456789
+
