@@ -954,11 +954,16 @@ void FlightPhaseTask(void* pvParameters) {
     }
     const float accelMag = sqrtf(ax*ax + ay*ay + az*az);
 
-    float altFt = 0.0f;
-    float verticalSpeed = 0.0f;
-    if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
-      xSemaphoreGive(countMutex);
-    }
+     float altFt = 0.0f;
+     float verticalSpeed = 0.0f;
+     if (xSemaphoreTake(telemetryMutex, portMAX_DELAY) == pdTRUE) {
+       altFt = latestSensorSample.bmpAltitude * 3.28084f;  // Convert meters to feet
+       verticalSpeed = latestSensorSample.bmpVSpeed * 3.28084f;  // Convert m/s to ft/s
+       xSemaphoreGive(telemetryMutex);
+     }
+     if (xSemaphoreTake(countMutex, portMAX_DELAY) == pdTRUE) {
+       xSemaphoreGive(countMutex);
+     }
 
     const unsigned long now = millis();
     float accelBaro = 0.0f;
