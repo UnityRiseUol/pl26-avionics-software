@@ -886,6 +886,10 @@ void GpsTask(void* pvParameters) {
       sampleGps.heading = sampleGps.rawHeading / 100000.0f;
       sampleGps.valid = true;
 
+      Serial.printf("GPS sample: lat=%.7f, lon=%.7f\n",
+                    static_cast<double>(sampleGps.latitude),
+                    static_cast<double>(sampleGps.longitude));
+
       if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
         latestGpsSample = sampleGps;
         xSemaphoreGive(gpsDataMutex);
