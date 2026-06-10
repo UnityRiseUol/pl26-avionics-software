@@ -27,6 +27,8 @@ extern "C" {
   #include "esp_system.h"
 }
 
+#include "esp_sleep.h"
+
 constexpr int CS_ICM = 3;
 constexpr int CS_BMP = 41;
 constexpr int CS_MMC = 45;
@@ -47,6 +49,13 @@ bool inMSCMode = false;
 bool loggingActive = false;
 RTC_DATA_ATTR uint32_t bootToMSC = 0;
 bool longPressHandled = false;
+
+constexpr uint32_t AUTO_SHUTDOWN_AFTER_LANDING_MS = 2UL * 60UL * 1000UL;
+constexpr uint32_t AUTO_SHUTDOWN_AFTER_LAUNCH_MS = 10UL * 60UL * 1000UL;
+constexpr uint32_t AUTO_SHUTDOWN_FROM_POWER_ON_MS = 60UL * 60UL * 1000UL;
+volatile uint32_t launchDetectedMillis = 0;
+volatile uint32_t landedDetectedMillis = 0;
+volatile bool autoShutdownIssued = false;
 
 SPIClass* sdcardSPI = nullptr;
 
@@ -254,7 +263,7 @@ private:
     int   _launchStreak, _burnoutStreak;
     float _apogeePeak;
     int   _apogeeStreak;
-    float _chuteBuf[CHUTE_BUF_SZ];
+    float _chuteBuf[CHUTE_BUF_SZ]{};
     int   _chuteHead, _chuteCount, _chuteWarmup;
     int   _landStreak;
 
@@ -333,6 +342,10 @@ void handleNotFound();
 
 void saveConfiguration();
 void loadConfiguration();
+
+bool hasElapsed(const uint32_t now, const uint32_t start, const uint32_t duration) {
+  return static_cast<uint32_t>(now - start) >= duration;
+}
 
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   analogWrite(RED_LED, r);
@@ -646,9 +659,13 @@ void startLogging() {
 
   latestGpsSample = {};
   latestSensorSample = {};
+  flightDetector.reset();
   haveLastBmpAltitude = false;
   lastBmpAltitude = 0.0f;
   lastBmpAltitudeMillis = 0;
+  launchDetectedMillis = 0;
+  landedDetectedMillis = 0;
+  autoShutdownIssued = false;
   stopSensorTask = false;
   stopSdTask = false;
   stopGpsTask = false;
@@ -780,6 +797,30 @@ void ControlTask(void* pvParameters) {
       setRGB(0, 0, 80);
     } else {
       if (loggingActive) ledHeartbeat(); else setRGB(0, ledBrightnessIdle, 0);
+
+      if (!autoShutdownIssued) {
+        const uint32_t nowMillis = millis();
+        bool shutdownDue = false;
+
+        // Priority: landed timeout first, launch fallback second, power-on fallback last.
+        if (landedDetectedMillis != 0) {
+          shutdownDue = hasElapsed(nowMillis, landedDetectedMillis, AUTO_SHUTDOWN_AFTER_LANDING_MS);
+        } else if (launchDetectedMillis != 0) {
+          shutdownDue = hasElapsed(nowMillis, launchDetectedMillis, AUTO_SHUTDOWN_AFTER_LAUNCH_MS);
+        } else {
+          shutdownDue = hasElapsed(nowMillis, 0, AUTO_SHUTDOWN_FROM_POWER_ON_MS);
+        }
+
+        if (shutdownDue) {
+          autoShutdownIssued = true;
+          Serial.println("Auto shutdown timeout reached. Entering deep sleep...");
+          if (loggingActive) {
+            stopLogging();
+          }
+          Serial.flush();
+          esp_deep_sleep_start();
+        }
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -879,11 +920,11 @@ void GpsTask(void* pvParameters) {
       sampleGps.rawAlt = myGNSS.getAltitude();
       sampleGps.rawSpeed = myGNSS.getGroundSpeed();
       sampleGps.rawHeading = myGNSS.getHeading();
-      sampleGps.latitude = sampleGps.rawLat / 10000000.0f;
-      sampleGps.longitude = sampleGps.rawLon / 10000000.0f;
-      sampleGps.altitude = sampleGps.rawAlt / 1000.0f;
-      sampleGps.speed = sampleGps.rawSpeed / 1000.0f;
-      sampleGps.heading = sampleGps.rawHeading / 100000.0f;
+      sampleGps.latitude = static_cast<float>(sampleGps.rawLat) / 10000000.0f;
+      sampleGps.longitude = static_cast<float>(sampleGps.rawLon) / 10000000.0f;
+      sampleGps.altitude = static_cast<float>(sampleGps.rawAlt) / 1000.0f;
+      sampleGps.speed = static_cast<float>(sampleGps.rawSpeed) / 1000.0f;
+      sampleGps.heading = static_cast<float>(sampleGps.rawHeading) / 100000.0f;
       sampleGps.valid = true;
 
       Serial.printf("GPS sample: lat=%.7f, lon=%.7f\n",
@@ -985,6 +1026,13 @@ void FlightPhaseTask(void* pvParameters) {
     }
 
     if (transition >= 0) {
+      const uint32_t transitionMillis = millis();
+      if (transition == 1 && launchDetectedMillis == 0) {
+        launchDetectedMillis = transitionMillis;
+      } else if (transition == 5 && landedDetectedMillis == 0) {
+        landedDetectedMillis = transitionMillis;
+      }
+
       Serial.printf("[FLIGHT PHASE] %d: %s\n",
                     transition, FLIGHT_PHASE_NAMES[transition]);
     }
@@ -1178,20 +1226,20 @@ void handleUpdateConfig() {
   }
 
    if (doc["pressure"].is<float>()) {
-     float p = doc["pressure"].as<float>();
+     auto p = doc["pressure"].as<float>();
      if (p >= 800.0f && p <= 1200.0f) seaLevelPressureHpa = p;
      else { webServer.send(400, "text/plain", "Invalid pressure value"); return; }
    }
    if (doc["sensorSampleRateMs"].is<uint32_t>()) {
-     uint32_t val = doc["sensorSampleRateMs"].as<uint32_t>();
+     auto val = doc["sensorSampleRateMs"].as<uint32_t>();
      if (val >= 5 && val <= 10000) sensorSampleRateMs = val;
    }
    if (doc["gpsSampleRateMs"].is<uint32_t>()) {
-     uint32_t val = doc["gpsSampleRateMs"].as<uint32_t>();
+     auto val = doc["gpsSampleRateMs"].as<uint32_t>();
      if (val >= 100 && val <= 60000) gpsSampleRateMs = val;
    }
    if (doc["logFlushIntervalMs"].is<uint32_t>()) {
-     uint32_t val = doc["logFlushIntervalMs"].as<uint32_t>();
+     auto val = doc["logFlushIntervalMs"].as<uint32_t>();
      if (val >= 500 && val <= 60000) logFlushIntervalMs = val;
    }
    if (doc["ledBrightnessHeartbeat"].is<uint8_t>()) {
@@ -1201,11 +1249,11 @@ void handleUpdateConfig() {
      ledBrightnessIdle = doc["ledBrightnessIdle"].as<uint8_t>();
    }
    if (doc["launchThresholdMultiplier"].is<float>()) {
-     float val = doc["launchThresholdMultiplier"].as<float>();
+     auto val = doc["launchThresholdMultiplier"].as<float>();
      if (val >= 1.0f && val <= 20.0f) launchThresholdMultiplier = val;
    }
    if (doc["burnoutThresholdMultiplier"].is<float>()) {
-     float val = doc["burnoutThresholdMultiplier"].as<float>();
+     auto val = doc["burnoutThresholdMultiplier"].as<float>();
      if (val >= 0.5f && val <= 10.0f) burnoutThresholdMultiplier = val;
    }
    if (doc["launchStreakRequired"].is<int>()) {
@@ -1225,7 +1273,7 @@ void handleUpdateConfig() {
      if (val >= 1 && val <= 100) landStreakRequired = val;
    }
    if (doc["landingAltitudeThresholdFt"].is<float>()) {
-     float val = doc["landingAltitudeThresholdFt"].as<float>();
+     auto val = doc["landingAltitudeThresholdFt"].as<float>();
      if (val >= 1.0f && val <= 500.0f) landingAltitudeThresholdFt = val;
    }
    if (doc["wifiSSID"].is<String>()) {
