@@ -153,9 +153,7 @@ static_assert(sizeof(TelemetryPacket) == 44, "TelemetryPacket must remain 44 byt
 
 QueueHandle_t logQueue = nullptr;
 File logFile;
-File vegaEventFile;
 char currentFilename[32];
-char vegaEventFilename[32];
 GpsSample latestGpsSample{};
 SensorSample latestSensorSample{};
 bool haveLastBmpAltitude = false;
@@ -563,19 +561,9 @@ void readVegaStateSnapshot(bool& on, char* statusText, size_t statusTextSize, ch
 }
 
 void logVegaEvent(uint32_t whenMillis, const char* direction, const char* message) {
-  if (!message || message[0] == '\0' || !vegaEventFile || !sdSpiMutex) return;
-
-  if (xSemaphoreTake(sdSpiMutex, portMAX_DELAY) == pdTRUE) {
-    if (vegaEventFile) {
-      vegaEventFile.print(whenMillis);
-      vegaEventFile.print(',');
-      vegaEventFile.print(direction ? direction : "UNKNOWN");
-      vegaEventFile.print(',');
-      vegaEventFile.println(message);
-      vegaEventFile.flush();
-    }
-    xSemaphoreGive(sdSpiMutex);
-  }
+  (void)whenMillis;
+  (void)direction;
+  (void)message;
 }
 
 void processVegaMessage(const char* message, uint32_t whenMillis) {
@@ -804,23 +792,9 @@ void startLogging() {
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
 
-  snprintf(vegaEventFilename, sizeof(vegaEventFilename), "/vega_uart_%lu.csv", static_cast<unsigned long>(fileIndex));
-  vegaEventFile = SD.open(vegaEventFilename, FILE_WRITE);
-  if (vegaEventFile) {
-    vegaEventFile.println("millis,direction,message");
-    vegaEventFile.flush();
-    Serial.print("VEGA UART event log: ");
-    Serial.println(vegaEventFilename);
-  } else {
-    Serial.println("Warning: could not open VEGA UART event log (continuing without backup CSV).");
-  }
-
   logQueue = xQueueCreate(128, sizeof(SensorSample));
   if (logQueue == nullptr) {
     Serial.println("Failed to create logging queue");
-    if (vegaEventFile) {
-      vegaEventFile.close();
-    }
     if (logFile) {
       logFile.close();
     }
@@ -859,9 +833,6 @@ void startLogging() {
 
   if (r0 != pdPASS || r1 != pdPASS || r3 != pdPASS || r4 != pdPASS || r5 != pdPASS) {
     Serial.println("Failed to create FreeRTOS tasks");
-    if (vegaEventFile) {
-      vegaEventFile.close();
-    }
     if (logFile) {
       logFile.close();
     }
@@ -906,9 +877,6 @@ void stopLogging() {
     logQueue = nullptr;
   }
 
-  if (vegaEventFile) {
-    vegaEventFile.close();
-  }
 
   loggingActive = false;
   Serial.println("Logging stopped.");
@@ -1320,11 +1288,6 @@ void VegaUartTask(void* pvParameters) {
 
   for (;;) {
     if (stopVegaTask) {
-      if (vegaEventFile && sdSpiMutex && xSemaphoreTake(sdSpiMutex, portMAX_DELAY) == pdTRUE) {
-        vegaEventFile.flush();
-        vegaEventFile.close();
-        xSemaphoreGive(sdSpiMutex);
-      }
       vegaTaskStopped = true;
       vTaskDelete(nullptr);
     }

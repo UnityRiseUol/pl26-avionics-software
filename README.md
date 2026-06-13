@@ -83,10 +83,9 @@ Flight-phase events trigger outgoing commands:
 - `VEGA_STARTED` when launch is detected
 - `STOP_VEGA` when landing/mission end is detected
 
-Incoming VEGA status lines are stored in the main flight CSV and mirrored to a backup event log:
+Incoming VEGA status lines are stored in the main flight CSV:
 
 - Main log columns now include `vegaOn`, `vegaStatus`, `vegaLastMessage`, `vegaLastMessageMillis`
-- Backup event log: `/vega_uart_<n>.csv`
 
 Expected inbound status messages include the Pi-side handshake and shutdown flow, for example:
 
