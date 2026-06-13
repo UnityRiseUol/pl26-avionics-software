@@ -70,6 +70,36 @@ Configured in code for:
 - CRC enabled
 - Bandwidth `500E3`, spreading factor `7`, coding rate `4/5`
 
+### VEGA Raspberry Pi UART Link
+
+LIFTSv2 now includes a dedicated UART link for the VEGA Raspberry Pi recorder.
+
+- UART TX: GPIO `17`
+- UART RX: GPIO `18`
+- Baud rate: `115200`
+
+Flight-phase events trigger outgoing commands:
+
+- `VEGA_STARTED` when launch is detected
+- `STOP_VEGA` when landing/mission end is detected
+
+Incoming VEGA status lines are stored in the main flight CSV and mirrored to a backup event log:
+
+- Main log columns now include `vegaOn`, `vegaStatus`, `vegaLastMessage`, `vegaLastMessageMillis`
+- Backup event log: `/vega_uart_<n>.csv`
+
+Expected inbound status messages include the Pi-side handshake and shutdown flow, for example:
+
+- `VEGA_START_ACKNOWLEDGED`
+- `VEGA_RECORDING_STARTED`
+- `VEGA_ACTIVE_T+10s`
+- `VEGA_STOP_ACKNOWLEDGE`
+- `VEGA_SAVING_DATA`
+- `VEGA_SAVED_AND_STOPPED`
+- `VEGA_DATA_SECURE_INITIATING_SHUTDOWN`
+
+If you need to rewire the Pi link, adjust the `VEGA_UART_*` constants near the top of `src/main.cpp`.
+
 ## Configuration
 
 Configuration is saved on SD card at:

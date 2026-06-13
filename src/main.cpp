@@ -44,6 +44,9 @@ constexpr int BUTTON_PIN = 16;
 constexpr int RED_LED = 26;
 constexpr int GREEN_LED = 48;
 constexpr int BLUE_LED = 21;
+constexpr int VEGA_UART_TX = 43;
+constexpr int VEGA_UART_RX = 44;
+constexpr uint32_t VEGA_UART_BAUD = 115200;
 
 bool inMSCMode = false;
 bool loggingActive = false;
@@ -90,6 +93,7 @@ SemaphoreHandle_t sdSpiMutex = nullptr;
 SemaphoreHandle_t countMutex = nullptr;
 SemaphoreHandle_t gpsDataMutex = nullptr;
 SemaphoreHandle_t telemetryMutex = nullptr;
+SemaphoreHandle_t vegaMutex = nullptr;
 
 volatile uint32_t pollCount = 0;
 volatile bool stopSensorTask = false;
@@ -100,6 +104,11 @@ volatile bool sensorTaskStopped = false;
 volatile bool sdLogTaskStopped = false;
 volatile bool gpsTaskStopped = false;
 volatile bool flightPhaseTaskStopped = false;
+volatile bool stopVegaTask = false;
+volatile bool vegaTaskStopped = false;
+volatile bool vegaStartCommandSent = false;
+volatile bool vegaStopCommandSent = false;
+volatile bool vegaOn = false;
 
 USBMSC msc;
 sdmmc_card_t* mscCard = nullptr;
@@ -144,17 +153,23 @@ static_assert(sizeof(TelemetryPacket) == 44, "TelemetryPacket must remain 44 byt
 
 QueueHandle_t logQueue = nullptr;
 File logFile;
+File vegaEventFile;
 char currentFilename[32];
+char vegaEventFilename[32];
 GpsSample latestGpsSample{};
 SensorSample latestSensorSample{};
 bool haveLastBmpAltitude = false;
 float lastBmpAltitude = 0.0f;
 uint32_t lastBmpAltitudeMillis = 0;
+char vegaStatusText[32] = "OFF";
+char vegaLastUartMessage[48] = "NONE";
+uint32_t vegaLastUartMillis = 0;
 
 bool initGPS();
 bool initLoRa();
 void startLogging();
 void stopLogging();
+void VegaUartTask(void* pvParameters);
 
 
 static constexpr const char* const FLIGHT_PHASE_NAMES[] = {
@@ -383,6 +398,15 @@ uint32_t findNextLogFileIndex() {
   }
 }
 
+void initVegaUart();
+void setVegaStateLocked(bool on, const char* statusText, const char* lastMessage, uint32_t messageMillis);
+void readVegaStateSnapshot(bool& on, char* statusText, size_t statusTextSize, char* lastMessage, size_t lastMessageSize, uint32_t& messageMillis);
+void logVegaEvent(uint32_t whenMillis, const char* direction, const char* message);
+void processVegaMessage(const char* message, uint32_t whenMillis);
+void sendVegaCommand(const char* command, bool markStart, bool markStop, const char* statusText);
+void requestVegaStart(uint32_t whenMillis);
+void requestVegaStop(uint32_t whenMillis);
+
 bool initGPS() {
   Wire.begin();
 
@@ -488,6 +512,134 @@ static bool mscOnStartStop(uint8_t power_condition, bool start, bool load_eject)
   return true;
 }
 
+void initVegaUart() {
+  if (!vegaMutex) {
+    vegaMutex = xSemaphoreCreateMutex();
+    if (!vegaMutex) {
+      Serial.println("Failed to create VEGA mutex");
+      setRGB(150, 0, 0);
+      while (true) delay(10);
+    }
+  }
+
+  Serial1.begin(VEGA_UART_BAUD, SERIAL_8N1, VEGA_UART_RX, VEGA_UART_TX);
+  Serial.printf("VEGA UART initialised at %lu baud on RX=%d TX=%d\n",
+                static_cast<unsigned long>(VEGA_UART_BAUD), VEGA_UART_RX, VEGA_UART_TX);
+
+  setVegaStateLocked(false, "OFF", "NONE", 0);
+  vegaStartCommandSent = false;
+  vegaStopCommandSent = false;
+}
+
+void setVegaStateLocked(bool on, const char* statusText, const char* lastMessage, uint32_t messageMillis) {
+  if (!vegaMutex) return;
+  if (xSemaphoreTake(vegaMutex, portMAX_DELAY) != pdTRUE) return;
+
+  vegaOn = on;
+  snprintf(vegaStatusText, sizeof(vegaStatusText), "%s", statusText ? statusText : "OFF");
+  if (lastMessage && lastMessage[0] != '\0') {
+    snprintf(vegaLastUartMessage, sizeof(vegaLastUartMessage), "%s", lastMessage);
+    vegaLastUartMillis = messageMillis;
+  }
+
+  xSemaphoreGive(vegaMutex);
+}
+
+void readVegaStateSnapshot(bool& on, char* statusText, size_t statusTextSize, char* lastMessage, size_t lastMessageSize, uint32_t& messageMillis) {
+  on = false;
+  snprintf(statusText, statusTextSize, "%s", "OFF");
+  snprintf(lastMessage, lastMessageSize, "%s", "NONE");
+  messageMillis = 0;
+
+  if (!vegaMutex) return;
+  if (xSemaphoreTake(vegaMutex, portMAX_DELAY) != pdTRUE) return;
+
+  on = vegaOn;
+  snprintf(statusText, statusTextSize, "%s", vegaStatusText);
+  snprintf(lastMessage, lastMessageSize, "%s", vegaLastUartMessage);
+  messageMillis = vegaLastUartMillis;
+
+  xSemaphoreGive(vegaMutex);
+}
+
+void logVegaEvent(uint32_t whenMillis, const char* direction, const char* message) {
+  if (!message || message[0] == '\0' || !vegaEventFile || !sdSpiMutex) return;
+
+  if (xSemaphoreTake(sdSpiMutex, portMAX_DELAY) == pdTRUE) {
+    if (vegaEventFile) {
+      vegaEventFile.print(whenMillis);
+      vegaEventFile.print(',');
+      vegaEventFile.print(direction ? direction : "UNKNOWN");
+      vegaEventFile.print(',');
+      vegaEventFile.println(message);
+      vegaEventFile.flush();
+    }
+    xSemaphoreGive(sdSpiMutex);
+  }
+}
+
+void processVegaMessage(const char* message, uint32_t whenMillis) {
+  if (!message || message[0] == '\0') return;
+
+  logVegaEvent(whenMillis, "RX", message);
+
+  bool on = true;
+  const char* statusText = "UNKNOWN";
+
+  if (strstr(message, "VEGA_SAVED_AND_STOPPED") || strstr(message, "VEGA_DATA_SECURE_INITIATING_SHUTDOWN") || strstr(message, "VEGA_OFF")) {
+    on = false;
+    statusText = "OFF";
+  } else if (strstr(message, "VEGA_STOP_ACKNOWLEDGE") || strstr(message, "VEGA_STOP_ACKNOWLEDGED")) {
+    on = true;
+    statusText = "STOPPING";
+  } else if (strstr(message, "VEGA_SAVING_DATA")) {
+    on = true;
+    statusText = "SAVING";
+  } else if (strstr(message, "VEGA_RECORDING_STARTED") || strstr(message, "VEGA_RECORDING") || strstr(message, "VEGA_ACTIVE_T+")) {
+    on = true;
+    statusText = "RECORDING";
+  } else if (strstr(message, "VEGA_START_ACKNOWLEDGED") || strstr(message, "VEGA_STARTED") || strstr(message, "VEGA_START")) {
+    on = true;
+    statusText = "START_PENDING";
+  } else {
+    statusText = "UNRECOGNISED";
+  }
+
+  setVegaStateLocked(on, statusText, message, whenMillis);
+}
+
+void sendVegaCommand(const char* command, bool markStart, bool markStop, const char* statusText) {
+  if (!command || command[0] == '\0') return;
+
+  if (markStart && vegaStartCommandSent) return;
+  if (markStop && vegaStopCommandSent) return;
+
+  Serial.print("UART->VEGA: ");
+  Serial.println(command);
+  Serial1.println(command);
+  Serial1.flush();
+
+  const uint32_t now = millis();
+  logVegaEvent(now, "TX", command);
+
+  if (markStart) vegaStartCommandSent = true;
+  if (markStop) vegaStopCommandSent = true;
+
+  setVegaStateLocked(true, statusText ? statusText : "PENDING", command, now);
+}
+
+void requestVegaStart(uint32_t whenMillis) {
+  (void)whenMillis;
+  if (vegaStartCommandSent) return;
+  sendVegaCommand("VEGA_STARTED", true, false, "START_SENT");
+}
+
+void requestVegaStop(uint32_t whenMillis) {
+  (void)whenMillis;
+  if (vegaStopCommandSent || (!vegaStartCommandSent && !vegaOn)) return;
+  sendVegaCommand("STOP_VEGA", false, true, "STOP_SENT");
+}
+
 void setupMSCMode() {
   Serial.println("=== Entering MSC mode ===");
   setRGB(50, 25, 0);
@@ -588,6 +740,8 @@ void setupLoggerMode() {
     while (true) delay(10);
   }
 
+  initVegaUart();
+
   BaseType_t r2 = xTaskCreate(PrintTask, "Printer", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   if (r2 != pdPASS) {
     Serial.println("Failed to create PrintTask");
@@ -645,14 +799,31 @@ void startLogging() {
     return;
   }
 
-  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading,flightPhase");
+  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading,flightPhase,vegaOn,vegaStatus,vegaLastMessage,vegaLastMessageMillis");
   logFile.flush();
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
 
+  snprintf(vegaEventFilename, sizeof(vegaEventFilename), "/vega_uart_%lu.csv", static_cast<unsigned long>(fileIndex));
+  vegaEventFile = SD.open(vegaEventFilename, FILE_WRITE);
+  if (vegaEventFile) {
+    vegaEventFile.println("millis,direction,message");
+    vegaEventFile.flush();
+    Serial.print("VEGA UART event log: ");
+    Serial.println(vegaEventFilename);
+  } else {
+    Serial.println("Warning: could not open VEGA UART event log (continuing without backup CSV).");
+  }
+
   logQueue = xQueueCreate(128, sizeof(SensorSample));
   if (logQueue == nullptr) {
     Serial.println("Failed to create logging queue");
+    if (vegaEventFile) {
+      vegaEventFile.close();
+    }
+    if (logFile) {
+      logFile.close();
+    }
     setRGB(150, 0, 0);
     return;
   }
@@ -666,6 +837,11 @@ void startLogging() {
   launchDetectedMillis = 0;
   landedDetectedMillis = 0;
   autoShutdownIssued = false;
+  stopVegaTask = false;
+  vegaTaskStopped = false;
+  vegaStartCommandSent = false;
+  vegaStopCommandSent = false;
+  setVegaStateLocked(false, "OFF", "NONE", 0);
   stopSensorTask = false;
   stopSdTask = false;
   stopGpsTask = false;
@@ -679,9 +855,16 @@ void startLogging() {
   BaseType_t r1 = xTaskCreate(SensorPollTask, "SensorPoll", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr);
   BaseType_t r3 = xTaskCreate(SdLogTask, "SDLog", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   BaseType_t r4 = xTaskCreate(FlightPhaseTask, "FlightPhase", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  BaseType_t r5 = xTaskCreate(VegaUartTask, "VegaUART", 3072, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
-  if (r0 != pdPASS || r1 != pdPASS || r3 != pdPASS || r4 != pdPASS) {
+  if (r0 != pdPASS || r1 != pdPASS || r3 != pdPASS || r4 != pdPASS || r5 != pdPASS) {
     Serial.println("Failed to create FreeRTOS tasks");
+    if (vegaEventFile) {
+      vegaEventFile.close();
+    }
+    if (logFile) {
+      logFile.close();
+    }
     setRGB(150, 0, 0);
     return;
   }
@@ -707,6 +890,11 @@ void stopLogging() {
   t0 = millis();
   while (!flightPhaseTaskStopped && (millis() - t0) < 1000) delay(10);
 
+  requestVegaStop(millis());
+  stopVegaTask = true;
+  t0 = millis();
+  while (!vegaTaskStopped && (millis() - t0) < 2000) delay(10);
+
   stopSdTask = true;
   t0 = millis();
   while (!sdLogTaskStopped && (millis() - t0) < 3000) delay(10);
@@ -716,6 +904,10 @@ void stopLogging() {
   if (logQueue) {
     vQueueDelete(logQueue);
     logQueue = nullptr;
+  }
+
+  if (vegaEventFile) {
+    vegaEventFile.close();
   }
 
   loggingActive = false;
@@ -1029,8 +1221,10 @@ void FlightPhaseTask(void* pvParameters) {
       const uint32_t transitionMillis = millis();
       if (transition == 1 && launchDetectedMillis == 0) {
         launchDetectedMillis = transitionMillis;
+        requestVegaStart(transitionMillis);
       } else if (transition == 5 && landedDetectedMillis == 0) {
         landedDetectedMillis = transitionMillis;
+        requestVegaStop(transitionMillis);
       }
 
       Serial.printf("[FLIGHT PHASE] %d: %s\n",
@@ -1068,7 +1262,18 @@ void SdLogTask(void* pvParameters) {
     logFile.print(sample.gps.altitude, 3);       logFile.print(',');
     logFile.print(sample.gps.speed, 3);          logFile.print(',');
     logFile.print(sample.gps.heading, 3);        logFile.print(',');
-    logFile.println(sample.flightPhase);
+    logFile.print(sample.flightPhase);            logFile.print(',');
+
+    bool vegaOnSnapshot = false;
+    char vegaStatusSnapshot[32];
+    char vegaLastMessageSnapshot[48];
+    uint32_t vegaLastMessageMillisSnapshot = 0;
+    readVegaStateSnapshot(vegaOnSnapshot, vegaStatusSnapshot, sizeof(vegaStatusSnapshot), vegaLastMessageSnapshot, sizeof(vegaLastMessageSnapshot), vegaLastMessageMillisSnapshot);
+
+    logFile.print(vegaOnSnapshot ? 1 : 0);        logFile.print(',');
+    logFile.print(vegaStatusSnapshot);            logFile.print(',');
+    logFile.print(vegaLastMessageSnapshot);       logFile.print(',');
+    logFile.println(vegaLastMessageMillisSnapshot);
   };
 
   for (;;) {
@@ -1104,6 +1309,40 @@ void SdLogTask(void* pvParameters) {
       }
       lastFlush = xTaskGetTickCount();
     }
+  }
+}
+
+void VegaUartTask(void* pvParameters) {
+  (void)pvParameters;
+  constexpr TickType_t pollDelay = pdMS_TO_TICKS(20);
+  char line[96];
+  size_t lineLength = 0;
+
+  for (;;) {
+    if (stopVegaTask) {
+      if (vegaEventFile && sdSpiMutex && xSemaphoreTake(sdSpiMutex, portMAX_DELAY) == pdTRUE) {
+        vegaEventFile.flush();
+        vegaEventFile.close();
+        xSemaphoreGive(sdSpiMutex);
+      }
+      vegaTaskStopped = true;
+      vTaskDelete(nullptr);
+    }
+
+    while (Serial1.available() > 0) {
+      const char ch = static_cast<char>(Serial1.read());
+      if (ch == '\r' || ch == '\n') {
+        if (lineLength > 0) {
+          line[lineLength] = '\0';
+          processVegaMessage(line, millis());
+          lineLength = 0;
+        }
+      } else if (lineLength < sizeof(line) - 1) {
+        line[lineLength++] = ch;
+      }
+    }
+
+    vTaskDelay(pollDelay);
   }
 }
 
