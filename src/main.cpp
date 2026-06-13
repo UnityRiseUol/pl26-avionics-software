@@ -583,10 +583,16 @@ void processVegaMessage(const char* message, uint32_t whenMillis) {
   } else if (strstr(message, "VEGA_SAVING_DATA")) {
     on = true;
     statusText = "SAVING";
+  } else if (strstr(message, "VEGA_FAILSAFE_TIMEOUT_STOP")) {
+    on = true;
+    statusText = "TIMEOUT_STOPPING";
+  } else if (strstr(message, "VEGA_INITIALISING_CAMERAS")) {
+    on = true;
+    statusText = "CAM_INIT";
   } else if (strstr(message, "VEGA_RECORDING_STARTED") || strstr(message, "VEGA_RECORDING") || strstr(message, "VEGA_ACTIVE_T+")) {
     on = true;
     statusText = "RECORDING";
-  } else if (strstr(message, "VEGA_START_ACKNOWLEDGED") || strstr(message, "VEGA_STARTED") || strstr(message, "VEGA_START")) {
+  } else if (strstr(message, "VEGA_START_ACKNOWLEDGED") || strstr(message, "VEGA_FAILSAFE_LAUNCH_OVERRIDE") || strstr(message, "VEGA_STARTED")) {
     on = true;
     statusText = "START_PENDING";
   } else {
@@ -1622,5 +1628,3 @@ void loadConfiguration() {
                 static_cast<unsigned long>(sensorSampleRateMs),
                 static_cast<unsigned long>(gpsSampleRateMs));
 }
-
-
