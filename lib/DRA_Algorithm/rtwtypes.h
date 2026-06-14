@@ -5,14 +5,14 @@
 //
 // File: rtwtypes.h
 //
-// Code generated for Simulink model 'INS_Model_C'.
+// Code generated for Simulink model 'LIFTSv2_DRA'.
 //
-// Model version                  : 2.0
-// Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Fri Feb  6 15:48:55 2026
+// Model version                  : 1.22
+// Simulink Coder version         : 26.1 (R2026a) 20-Nov-2025
+// C/C++ source code generated on : Sun Jun 14 19:57:34 2026
 //
 // Target selection: ert.tlc
-// Embedded hardware selection: ARM Compatible->ARM Cortex-M
+// Embedded hardware selection: Intel->x86-64 (Windows64)
 // Code generation objectives: Unspecified
 // Validation result: Not run
 //
@@ -33,10 +33,10 @@
 
 //=======================================================================*
 //  Target hardware information
-//    Device type: ARM Compatible->ARM Cortex-M
+//    Device type: Intel->x86-64 (Windows64)
 //    Number of bits:     char:   8    short:   16    int:  32
 //                        long:  32
-//                        native word size:  32
+//                        native word size:  64
 //    Byte ordering: LittleEndian
 //    Signed integer division rounds to: Zero
 //    Shift right on a signed integer as arithmetic shift: on
