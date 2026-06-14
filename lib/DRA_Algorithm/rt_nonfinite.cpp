@@ -7,9 +7,9 @@
 //
 // Code generated for Simulink model 'LIFTSv2_DRA'.
 //
-// Model version                  : 1.22
+// Model version                  : 1.23
 // Simulink Coder version         : 26.1 (R2026a) 20-Nov-2025
-// C/C++ source code generated on : Sun Jun 14 19:57:34 2026
+// C/C++ source code generated on : Sun Jun 14 20:30:55 2026
 //
 // Target selection: ert.tlc
 // Embedded hardware selection: Intel->x86-64 (Windows64)

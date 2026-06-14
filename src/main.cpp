@@ -20,6 +20,8 @@
 #include "USB.h"
 #include "USBMSC.h"
 
+#include <LIFTSv2_DRA.h>
+
 extern "C" {
   #include "driver/sdspi_host.h"
   #include "driver/spi_common.h"
@@ -66,6 +68,17 @@ ICM42688* IMU = nullptr;
 Adafruit_BMP5xx bmp;
 SFE_MMC5983MA myMag;
 SFE_UBLOX_GNSS myGNSS;
+static LIFTSv2_DRA dra;
+
+static float draLaunchLLA[3] = {0.0f, 0.0f, 0.0f};
+static bool haveDraLaunchLLA = false;
+
+struct DraSnapshot {
+  float quat[4];
+  float predictedLLA[3];
+  float displacement[3];
+};
+static DraSnapshot latestDraSnapshot{};
 
 String ap_ssid = "LIFTSv2";
 String ap_password = "123456789";
@@ -87,6 +100,8 @@ int burnoutStreakRequired = 5;
 int apogeeStreakRequired = 8;
 int landStreakRequired = 10;
 float landingAltitudeThresholdFt = 15.0f;
+float launchLLA[3] = {0.0f, 0.0f, 0.0f};
+bool useConfiguredLaunchLLA = false;
 
 SemaphoreHandle_t sensorSpiMutex = nullptr;
 SemaphoreHandle_t sdSpiMutex = nullptr;
@@ -356,6 +371,33 @@ void handleNotFound();
 
 void saveConfiguration();
 void loadConfiguration();
+
+static bool launchLLAIsConfigured() {
+  return useConfiguredLaunchLLA;
+}
+
+static void applyLaunchLLAFromConfig() {
+  if (launchLLAIsConfigured()) {
+    draLaunchLLA[0] = launchLLA[0];
+    draLaunchLLA[1] = launchLLA[1];
+    draLaunchLLA[2] = launchLLA[2];
+    haveDraLaunchLLA = true;
+  }
+}
+
+static void resetLaunchLLAFromGps() {
+  if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
+    if (latestGpsSample.valid) {
+      draLaunchLLA[0] = latestGpsSample.latitude;
+      draLaunchLLA[1] = latestGpsSample.longitude;
+      draLaunchLLA[2] = latestGpsSample.altitude;
+      haveDraLaunchLLA = true;
+    } else {
+      haveDraLaunchLLA = false;
+    }
+    xSemaphoreGive(gpsDataMutex);
+  }
+}
 
 bool hasElapsed(const uint32_t now, const uint32_t start, const uint32_t duration) {
   return static_cast<uint32_t>(now - start) >= duration;
@@ -794,7 +836,7 @@ void startLogging() {
     return;
   }
 
-  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading,flightPhase,vegaOn,vegaStatus,vegaLastMessage,vegaLastMessageMillis");
+  logFile.println("millis,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,imuTemp,bmpTemp,bmpPressure,bmpAltitude,bmpVSpeed,magX,magY,magZ,gpsFixMillis,gpsValid,gpsLatitude,gpsLongitude,gpsAltitude,gpsSpeed,gpsHeading,flightPhase,q0,q1,q2,q3,predLat,predLon,predAlt,insX,insY,insZ,vegaOn,vegaStatus,vegaLastMessage,vegaLastMessageMillis");
   logFile.flush();
   Serial.print("Logging to file: ");
   Serial.println(currentFilename);
@@ -832,9 +874,11 @@ void startLogging() {
   gpsTaskStopped = false;
   flightPhaseTaskStopped = false;
 
+  dra.initialize();
+
   BaseType_t r0 = xTaskCreate(GpsTask, "GpsPoll", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
-  BaseType_t r1 = xTaskCreate(SensorPollTask, "SensorPoll", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr);
-  BaseType_t r3 = xTaskCreate(SdLogTask, "SDLog", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  BaseType_t r1 = xTaskCreate(SensorPollTask, "SensorPoll", 8192, nullptr, tskIDLE_PRIORITY + 2, nullptr);
+  BaseType_t r3 = xTaskCreate(SdLogTask, "SDLog", 8192, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   BaseType_t r4 = xTaskCreate(FlightPhaseTask, "FlightPhase", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   BaseType_t r5 = xTaskCreate(VegaUartTask, "VegaUART", 3072, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
@@ -848,6 +892,12 @@ void startLogging() {
   }
 
   loggingActive = true;
+
+  if (launchLLAIsConfigured()) {
+    applyLaunchLLAFromConfig();
+  } else {
+    resetLaunchLLAFromGps();
+  }
 }
 
 void stopLogging() {
@@ -1044,10 +1094,66 @@ void SensorPollTask(void* pvParameters) {
       xSemaphoreGive(gpsDataMutex);
     }
 
+    if (!haveDraLaunchLLA && sample.gps.valid) {
+      if (xSemaphoreTake(gpsDataMutex, portMAX_DELAY) == pdTRUE) {
+        if (!haveDraLaunchLLA && sample.gps.valid) {
+          draLaunchLLA[0] = sample.gps.latitude;
+          draLaunchLLA[1] = sample.gps.longitude;
+          draLaunchLLA[2] = sample.gps.altitude;
+          haveDraLaunchLLA = true;
+        }
+        xSemaphoreGive(gpsDataMutex);
+      }
+    }
+
     sample.sampleMillis = millis();
 
     if (telemetryMutex && xSemaphoreTake(telemetryMutex, portMAX_DELAY) == pdTRUE) {
       latestSensorSample = sample;
+
+      LIFTSv2_DRA::ExtU_LIFTSv2_DRA_T draIn{};
+      // Accel
+      draIn.Accel_XYZ[0] = sample.accelX;
+      draIn.Accel_XYZ[1] = sample.accelY;
+      draIn.Accel_XYZ[2] = sample.accelZ;
+      // Gyro
+      draIn.Gyro_XYZ[0] = sample.gyroX;
+      draIn.Gyro_XYZ[1] = sample.gyroY;
+      draIn.Gyro_XYZ[2] = sample.gyroZ;
+      // Mag
+      draIn.Mag_XYZ[0] = static_cast<real32_T>(sample.magX);
+      draIn.Mag_XYZ[1] = static_cast<real32_T>(sample.magY);
+      draIn.Mag_XYZ[2] = static_cast<real32_T>(sample.magZ);
+      // GPS
+      draIn.Gps_Valid = sample.gps.valid ? static_cast<boolean_T>(1) : static_cast<boolean_T>(0);
+      draIn.Gps_Lat = sample.gps.latitude;
+      draIn.Gps_Lon = sample.gps.longitude;
+      draIn.Gps_Alt = sample.gps.altitude;
+      // Launch LLA (configured origin or first valid GPS fix)
+      draIn.Launch_LLA[0] = haveDraLaunchLLA ? draLaunchLLA[0] : 0.0f;
+      draIn.Launch_LLA[1] = haveDraLaunchLLA ? draLaunchLLA[1] : 0.0f;
+      draIn.Launch_LLA[2] = haveDraLaunchLLA ? draLaunchLLA[2] : 0.0f;
+      // Barometer inputs
+      draIn.Bmp_Alt = sample.bmpAltitude;
+      draIn.Bmp_Vspeed = sample.bmpVSpeed;
+
+      // Feed into DRA and step
+      dra.setExternalInputs(&draIn);
+      dra.step();
+
+      // Snapshot outputs
+      const auto &draOut = dra.getExternalOutputs();
+      latestDraSnapshot.quat[0] = draOut.Orientation_Quaternion[0];
+      latestDraSnapshot.quat[1] = draOut.Orientation_Quaternion[1];
+      latestDraSnapshot.quat[2] = draOut.Orientation_Quaternion[2];
+      latestDraSnapshot.quat[3] = draOut.Orientation_Quaternion[3];
+      latestDraSnapshot.predictedLLA[0] = draOut.Predicted_LLA[0];
+      latestDraSnapshot.predictedLLA[1] = draOut.Predicted_LLA[1];
+      latestDraSnapshot.predictedLLA[2] = draOut.Predicted_LLA[2];
+      latestDraSnapshot.displacement[0] = draOut.Displacement_XYZ[0];
+      latestDraSnapshot.displacement[1] = draOut.Displacement_XYZ[1];
+      latestDraSnapshot.displacement[2] = draOut.Displacement_XYZ[2];
+
       xSemaphoreGive(telemetryMutex);
     }
 
@@ -1126,6 +1232,13 @@ void LoRaTask(void* pvParameters) {
       packet.altitude = latestSensorSample.bmpAltitude;
       packet.vSpeed = latestSensorSample.bmpVSpeed;
       packet.flightPhase = static_cast<int32_t>(latestSensorSample.flightPhase);
+      packet.qR = latestDraSnapshot.quat[0];
+      packet.qI = latestDraSnapshot.quat[1];
+      packet.qJ = latestDraSnapshot.quat[2];
+      packet.qK = latestDraSnapshot.quat[3];
+      packet.insX = latestDraSnapshot.displacement[0];
+      packet.insY = latestDraSnapshot.displacement[1];
+      packet.insZ = latestDraSnapshot.displacement[2];
       xSemaphoreGive(telemetryMutex);
     }
 
@@ -1239,6 +1352,26 @@ void SdLogTask(void* pvParameters) {
     logFile.print(sample.gps.speed, 3);          logFile.print(',');
     logFile.print(sample.gps.heading, 3);        logFile.print(',');
     logFile.print(sample.flightPhase);            logFile.print(',');
+    float dq0 = 0.0f, dq1 = 0.0f, dq2 = 0.0f, dq3 = 0.0f;
+    float predLat = 0.0f, predLon = 0.0f, predAlt = 0.0f;
+    float insX = 0.0f, insY = 0.0f, insZ = 0.0f;
+    if (telemetryMutex && xSemaphoreTake(telemetryMutex, portMAX_DELAY) == pdTRUE) {
+      dq0 = latestDraSnapshot.quat[0]; dq1 = latestDraSnapshot.quat[1]; dq2 = latestDraSnapshot.quat[2]; dq3 = latestDraSnapshot.quat[3];
+      predLat = latestDraSnapshot.predictedLLA[0]; predLon = latestDraSnapshot.predictedLLA[1]; predAlt = latestDraSnapshot.predictedLLA[2];
+      insX = latestDraSnapshot.displacement[0]; insY = latestDraSnapshot.displacement[1]; insZ = latestDraSnapshot.displacement[2];
+      xSemaphoreGive(telemetryMutex);
+    }
+
+    logFile.print(dq0, 6); logFile.print(',');
+    logFile.print(dq1, 6); logFile.print(',');
+    logFile.print(dq2, 6); logFile.print(',');
+    logFile.print(dq3, 6); logFile.print(',');
+    logFile.print(predLat, 7); logFile.print(',');
+    logFile.print(predLon, 7); logFile.print(',');
+    logFile.print(predAlt, 6); logFile.print(',');
+    logFile.print(insX, 6); logFile.print(',');
+    logFile.print(insY, 6); logFile.print(',');
+    logFile.print(insZ, 6); logFile.print(',');
 
     bool vegaOnSnapshot = false;
     char vegaStatusSnapshot[32];
@@ -1412,6 +1545,10 @@ void handleGetConfig() {
   doc["apogeeStreakRequired"] = apogeeStreakRequired;
   doc["landStreakRequired"] = landStreakRequired;
   doc["landingAltitudeThresholdFt"] = String(landingAltitudeThresholdFt, 2);
+  doc["launchLLA0"] = String(launchLLA[0], 7);
+  doc["launchLLA1"] = String(launchLLA[1], 7);
+  doc["launchLLA2"] = String(launchLLA[2], 3);
+  doc["useConfiguredLaunchLLA"] = useConfiguredLaunchLLA;
   doc["wifiSSID"] = ap_ssid;
   doc["wifiPassword"] = ap_password;
 
@@ -1486,6 +1623,18 @@ void handleUpdateConfig() {
      auto val = doc["landingAltitudeThresholdFt"].as<float>();
      if (val >= 1.0f && val <= 500.0f) landingAltitudeThresholdFt = val;
    }
+    if (doc["launchLLA0"].is<float>()) {
+      launchLLA[0] = doc["launchLLA0"].as<float>();
+    }
+    if (doc["launchLLA1"].is<float>()) {
+      launchLLA[1] = doc["launchLLA1"].as<float>();
+    }
+    if (doc["launchLLA2"].is<float>()) {
+      launchLLA[2] = doc["launchLLA2"].as<float>();
+    }
+    if (doc["useConfiguredLaunchLLA"].is<bool>()) {
+      useConfiguredLaunchLLA = doc["useConfiguredLaunchLLA"].as<bool>();
+    }
    if (doc["wifiSSID"].is<String>()) {
      ap_ssid = doc["wifiSSID"].as<String>();
    }
@@ -1543,6 +1692,18 @@ void saveConfiguration() {
 
   f.print("landingAltitudeThresholdFt=");
   f.println(String(landingAltitudeThresholdFt, 2));
+
+  f.print("launchLLA0=");
+  f.println(String(launchLLA[0], 7));
+
+  f.print("launchLLA1=");
+  f.println(String(launchLLA[1], 7));
+
+  f.print("launchLLA2=");
+  f.println(String(launchLLA[2], 3));
+
+  f.print("useConfiguredLaunchLLA=");
+  f.println(useConfiguredLaunchLLA ? 1 : 0);
 
   f.print("wifiSSID=");
   f.println(ap_ssid);
@@ -1615,6 +1776,18 @@ void loadConfiguration() {
     else if (line.startsWith("landingAltitudeThresholdFt=")) {
       landingAltitudeThresholdFt = line.substring(line.indexOf('=') + 1).toFloat();
       if (landingAltitudeThresholdFt < 1.0f) landingAltitudeThresholdFt = 1.0f;
+    }
+    else if (line.startsWith("launchLLA0=")) {
+      launchLLA[0] = line.substring(line.indexOf('=') + 1).toFloat();
+    }
+    else if (line.startsWith("launchLLA1=")) {
+      launchLLA[1] = line.substring(line.indexOf('=') + 1).toFloat();
+    }
+    else if (line.startsWith("launchLLA2=")) {
+      launchLLA[2] = line.substring(line.indexOf('=') + 1).toFloat();
+    }
+    else if (line.startsWith("useConfiguredLaunchLLA=")) {
+      useConfiguredLaunchLLA = line.substring(line.indexOf('=') + 1).toInt() != 0;
     }
     else if (line.startsWith("wifiSSID=")) {
       ap_ssid = line.substring(line.indexOf('=') + 1);

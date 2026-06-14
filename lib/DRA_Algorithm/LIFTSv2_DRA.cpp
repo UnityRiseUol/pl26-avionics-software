@@ -7,9 +7,9 @@
 //
 // Code generated for Simulink model 'LIFTSv2_DRA'.
 //
-// Model version                  : 1.22
+// Model version                  : 1.23
 // Simulink Coder version         : 26.1 (R2026a) 20-Nov-2025
-// C/C++ source code generated on : Sun Jun 14 19:57:34 2026
+// C/C++ source code generated on : Sun Jun 14 20:30:55 2026
 //
 // Target selection: ert.tlc
 // Embedded hardware selection: Intel->x86-64 (Windows64)
@@ -19,7 +19,6 @@
 #include "LIFTSv2_DRA.h"
 #include "rtwtypes.h"
 #include <cmath>
-#include <xmmintrin.h>
 #include <cstring>
 
 // Function for MATLAB Function: '<Root>/MATLAB Function'
@@ -85,35 +84,21 @@ real32_T LIFTSv2_DRA::LIFTSv2_DRA_norm(const real32_T x[3])
 // Model step function
 void LIFTSv2_DRA::step()
 {
-  int32_T b_jBcol;
   int32_T b_k;
   int32_T e_k;
   int32_T ijA;
   int32_T jA;
+  int32_T jBcol;
   int32_T jj;
   int32_T kBcol;
+  real32_T b_I_0[81];
+  real32_T b_a[81];
+  real32_T A_tmp[72];
   real32_T X[72];
   real32_T A[64];
   real32_T R[64];
-  real32_T v[8];
-  real32_T w_mag;
-  int8_T b_I[81];
-  int8_T ipiv[8];
-  boolean_T gps_is_healthy;
-  static const real32_T b_a[81]{ 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-    0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
-    0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.01F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
-    0.0F, 0.0F, 0.0F, 0.0F, 0.01F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-    0.0F, 0.0F, 0.01F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-    0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-    1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F };
-
-  __m128 tmp_d;
-  __m128 tmp_e;
-  real32_T b_I_0[81];
-  real32_T b_a_0[81];
-  real32_T A_tmp[72];
   real32_T yhat_tmp_0[9];
+  real32_T v[8];
   real32_T tmp_c[3];
   real32_T dq_idx_0;
   real32_T dq_idx_1;
@@ -132,12 +117,16 @@ void LIFTSv2_DRA::step()
   real32_T tmp_9;
   real32_T tmp_a;
   real32_T tmp_b;
+  real32_T w_mag;
   real32_T yhat_tmp;
   real32_T yhat_tmp_tmp;
+  int8_T b_I[81];
+  int8_T ipiv[8];
   int8_T ipiv_0;
+  boolean_T gps_is_healthy;
   static const real32_T e[3]{ 0.0F, 0.0F, 9.80665F };
 
-  static const real32_T b_a_1[81]{ 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+  static const real32_T b_a_0[81]{ 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
     0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
     1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.01F, 0.0F, 0.0F, 1.0F, 0.0F,
     0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.01F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F,
@@ -286,9 +275,10 @@ void LIFTSv2_DRA::step()
     } while (exitg1 == 0);
   }
 
-  tmp_e = _mm_div_ps(_mm_loadu_ps(&LIFTSv2_DRA_DW.q_nav[0]), _mm_set1_ps
-                     (dq_idx_2));
-  _mm_storeu_ps(&LIFTSv2_DRA_DW.q_nav[0], tmp_e);
+  LIFTSv2_DRA_DW.q_nav[0] /= dq_idx_2;
+  LIFTSv2_DRA_DW.q_nav[1] /= dq_idx_2;
+  LIFTSv2_DRA_DW.q_nav[2] /= dq_idx_2;
+  LIFTSv2_DRA_DW.q_nav[3] /= dq_idx_2;
   w_mag = LIFTSv2_DRA_DW.q_nav[0] * LIFTSv2_DRA_DW.q_nav[0];
   yhat_tmp = LIFTSv2_DRA_DW.q_nav[1] * LIFTSv2_DRA_DW.q_nav[1];
   yhat_tmp_tmp = LIFTSv2_DRA_DW.q_nav[2] * LIFTSv2_DRA_DW.q_nav[2];
@@ -325,34 +315,27 @@ void LIFTSv2_DRA::step()
   LIFTSv2_DRA_DW.xhat[1] += LIFTSv2_DRA_DW.xhat[4] * 0.01F;
   LIFTSv2_DRA_DW.xhat[2] += LIFTSv2_DRA_DW.xhat[5] * 0.01F;
   for (jj = 0; jj < 9; jj++) {
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-      b_a_0[b_jBcol + 9 * jj] = 0.0F;
+    for (jBcol = 0; jBcol < 9; jBcol++) {
+      b_a[jBcol + 9 * jj] = 0.0F;
     }
 
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-      w_mag = LIFTSv2_DRA_DW.P[9 * jj + b_jBcol];
-      for (jA = 0; jA <= 4; jA += 4) {
-        e_k = 9 * jj + jA;
-        tmp_e = _mm_loadu_ps(&b_a_0[e_k]);
-        _mm_storeu_ps(&b_a_0[e_k], _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(&b_a[9 *
-          b_jBcol + jA]), _mm_set1_ps(w_mag)), tmp_e));
-      }
-
-      for (jA = 8; jA < 9; jA++) {
+    for (jBcol = 0; jBcol < 9; jBcol++) {
+      w_mag = LIFTSv2_DRA_DW.P[9 * jj + jBcol];
+      for (jA = 0; jA < 9; jA++) {
         b_k = 9 * jj + jA;
-        b_a_0[b_k] += b_a_1[9 * b_jBcol + jA] * w_mag;
+        b_a[b_k] += b_a_0[9 * jBcol + jA] * w_mag;
       }
     }
   }
 
   for (jj = 0; jj < 9; jj++) {
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
+    for (jBcol = 0; jBcol < 9; jBcol++) {
       w_mag = 0.0F;
       for (jA = 0; jA < 9; jA++) {
-        w_mag += b_a_0[9 * jA + jj] * f[9 * b_jBcol + jA];
+        w_mag += b_a[9 * jA + jj] * f[9 * jBcol + jA];
       }
 
-      b_k = 9 * b_jBcol + jj;
+      b_k = 9 * jBcol + jj;
       LIFTSv2_DRA_DW.P[b_k] = g[b_k] + w_mag;
     }
   }
@@ -378,9 +361,10 @@ void LIFTSv2_DRA::step()
   dq_idx_1 = 0.0F;
   dq_idx_2 = 0.0F;
   for (jj = 0; jj < 3; jj++) {
-    dq_idx_0 += yhat_tmp_0[3 * jj] * d_b[jj];
-    dq_idx_1 += yhat_tmp_0[3 * jj + 1] * d_b[jj];
-    dq_idx_2 += yhat_tmp_0[3 * jj + 2] * d_b[jj];
+    w_mag = d_b[jj];
+    dq_idx_0 += yhat_tmp_0[3 * jj] * w_mag;
+    dq_idx_1 += yhat_tmp_0[3 * jj + 1] * w_mag;
+    dq_idx_2 += yhat_tmp_0[3 * jj + 2] * w_mag;
   }
 
   if (LIFTSv2_DRA_U.Gps_Valid) {
@@ -406,49 +390,41 @@ void LIFTSv2_DRA::step()
   }
 
   for (jj = 0; jj < 9; jj++) {
-    for (b_jBcol = 0; b_jBcol < 8; b_jBcol++) {
-      A_tmp[b_jBcol + (jj << 3)] = 0.0F;
+    for (jBcol = 0; jBcol < 8; jBcol++) {
+      A_tmp[jBcol + (jj << 3)] = 0.0F;
     }
 
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-      w_mag = LIFTSv2_DRA_DW.P[9 * jj + b_jBcol];
+    for (jBcol = 0; jBcol < 9; jBcol++) {
+      w_mag = LIFTSv2_DRA_DW.P[9 * jj + jBcol];
       for (jA = 0; jA < 8; jA++) {
         b_k = (jj << 3) + jA;
-        A_tmp[b_k] += static_cast<real32_T>((&c_a[0])[(b_jBcol << 3) + jA]) *
+        A_tmp[b_k] += static_cast<real32_T>((&c_a[0])[(jBcol << 3) + jA]) *
           w_mag;
       }
     }
   }
 
   for (jj = 0; jj < 8; jj++) {
-    for (b_jBcol = 0; b_jBcol < 8; b_jBcol++) {
+    for (jBcol = 0; jBcol < 8; jBcol++) {
       w_mag = 0.0F;
       for (jA = 0; jA < 9; jA++) {
-        w_mag += A_tmp[(jA << 3) + jj] * static_cast<real32_T>((&l[0])[9 *
-          b_jBcol + jA]);
+        w_mag += A_tmp[(jA << 3) + jj] * static_cast<real32_T>((&l[0])[9 * jBcol
+          + jA]);
       }
 
-      jA = (b_jBcol << 3) + jj;
+      jA = (jBcol << 3) + jj;
       A[jA] = R[jA] + w_mag;
     }
 
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-      X[b_jBcol + 9 * jj] = 0.0F;
+    for (jBcol = 0; jBcol < 9; jBcol++) {
+      X[jBcol + 9 * jj] = 0.0F;
     }
 
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-      jA = (&l[0])[9 * jj + b_jBcol];
-      for (e_k = 0; e_k <= 4; e_k += 4) {
-        tmp_e = _mm_loadu_ps(&LIFTSv2_DRA_DW.P[9 * b_jBcol + e_k]);
+    for (jBcol = 0; jBcol < 9; jBcol++) {
+      jA = (&l[0])[9 * jj + jBcol];
+      for (e_k = 0; e_k < 9; e_k++) {
         b_k = 9 * jj + e_k;
-        tmp_d = _mm_loadu_ps(&X[b_k]);
-        _mm_storeu_ps(&X[b_k], _mm_add_ps(_mm_mul_ps(tmp_e, _mm_set1_ps(
-          static_cast<real32_T>(jA))), tmp_d));
-      }
-
-      for (e_k = 8; e_k < 9; e_k++) {
-        b_k = 9 * jj + e_k;
-        X[b_k] += LIFTSv2_DRA_DW.P[9 * b_jBcol + e_k] * static_cast<real32_T>(jA);
+        X[b_k] += LIFTSv2_DRA_DW.P[9 * jBcol + e_k] * static_cast<real32_T>(jA);
       }
     }
 
@@ -457,10 +433,10 @@ void LIFTSv2_DRA::step()
 
   for (b_k = 0; b_k < 7; b_k++) {
     jj = b_k * 9;
-    b_jBcol = 9 - b_k;
+    jBcol = 9 - b_k;
     jA = 0;
     w_mag = std::abs(A[jj]);
-    for (e_k = 2; e_k < b_jBcol; e_k++) {
+    for (e_k = 2; e_k < jBcol; e_k++) {
       dq_idx_3 = std::abs(A[(jj + e_k) - 1]);
       if (dq_idx_3 > w_mag) {
         jA = e_k - 1;
@@ -470,34 +446,27 @@ void LIFTSv2_DRA::step()
 
     if (A[jj + jA] != 0.0F) {
       if (jA != 0) {
-        b_jBcol = b_k + jA;
-        ipiv[b_k] = static_cast<int8_T>(b_jBcol + 1);
+        jBcol = b_k + jA;
+        ipiv[b_k] = static_cast<int8_T>(jBcol + 1);
         for (e_k = 0; e_k < 8; e_k++) {
           jA = e_k << 3;
           kBcol = jA + b_k;
           w_mag = A[kBcol];
-          jA += b_jBcol;
+          jA += jBcol;
           A[kBcol] = A[jA];
           A[jA] = w_mag;
         }
       }
 
-      b_jBcol = (jj - b_k) + 8;
-      jA = (((((b_jBcol - jj) - 1) / 4) << 2) + jj) + 2;
-      e_k = jA - 4;
-      for (kBcol = jj + 2; kBcol <= e_k; kBcol += 4) {
-        tmp_e = _mm_loadu_ps(&A[kBcol - 1]);
-        _mm_storeu_ps(&A[kBcol - 1], _mm_div_ps(tmp_e, _mm_set1_ps(A[jj])));
-      }
-
-      for (kBcol = jA; kBcol <= b_jBcol; kBcol++) {
-        A[kBcol - 1] /= A[jj];
+      jBcol = (jj - b_k) + 8;
+      for (jA = jj + 2; jA <= jBcol; jA++) {
+        A[jA - 1] /= A[jj];
       }
     }
 
-    b_jBcol = 6 - b_k;
+    jBcol = 6 - b_k;
     jA = jj + 10;
-    for (e_k = 0; e_k <= b_jBcol; e_k++) {
+    for (e_k = 0; e_k <= jBcol; e_k++) {
       w_mag = A[((e_k << 3) + jj) + 8];
       if (w_mag != 0.0F) {
         kBcol = (jA - b_k) + 6;
@@ -510,42 +479,36 @@ void LIFTSv2_DRA::step()
     }
   }
 
-  for (b_jBcol = 0; b_jBcol < 8; b_jBcol++) {
-    jA = 9 * b_jBcol;
-    jj = b_jBcol << 3;
-    for (e_k = 0; e_k < b_jBcol; e_k++) {
+  for (jj = 0; jj < 8; jj++) {
+    jBcol = 9 * jj;
+    jA = jj << 3;
+    for (e_k = 0; e_k < jj; e_k++) {
       kBcol = 9 * e_k;
-      w_mag = A[e_k + jj];
+      w_mag = A[e_k + jA];
       if (w_mag != 0.0F) {
         for (ijA = 0; ijA < 9; ijA++) {
-          b_k = ijA + jA;
+          b_k = ijA + jBcol;
           X[b_k] -= X[ijA + kBcol] * w_mag;
         }
       }
     }
 
-    w_mag = 1.0F / A[b_jBcol + jj];
-    for (e_k = 0; e_k <= 4; e_k += 4) {
-      jj = e_k + jA;
-      tmp_e = _mm_loadu_ps(&X[jj]);
-      _mm_storeu_ps(&X[jj], _mm_mul_ps(tmp_e, _mm_set1_ps(w_mag)));
-    }
-
-    for (e_k = 8; e_k < 9; e_k++) {
-      b_k = e_k + jA;
+    w_mag = 1.0F / A[jj + jA];
+    for (jA = 0; jA < 9; jA++) {
+      b_k = jA + jBcol;
       X[b_k] *= w_mag;
     }
   }
 
   for (jj = 7; jj >= 0; jj--) {
-    b_jBcol = 9 * jj;
+    jBcol = 9 * jj;
     jA = (jj << 3) - 1;
     for (e_k = jj + 2; e_k < 9; e_k++) {
       kBcol = (e_k - 1) * 9;
       w_mag = A[e_k + jA];
       if (w_mag != 0.0F) {
         for (ijA = 0; ijA < 9; ijA++) {
-          b_k = ijA + b_jBcol;
+          b_k = ijA + jBcol;
           X[b_k] -= X[ijA + kBcol] * w_mag;
         }
       }
@@ -555,10 +518,10 @@ void LIFTSv2_DRA::step()
   for (jj = 6; jj >= 0; jj--) {
     ipiv_0 = ipiv[jj];
     if (jj + 1 != ipiv_0) {
-      for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-        jA = 9 * jj + b_jBcol;
+      for (jBcol = 0; jBcol < 9; jBcol++) {
+        jA = 9 * jj + jBcol;
         w_mag = X[jA];
-        b_k = (ipiv_0 - 1) * 9 + b_jBcol;
+        b_k = (ipiv_0 - 1) * 9 + jBcol;
         X[jA] = X[b_k];
         X[b_k] = w_mag;
       }
@@ -572,14 +535,15 @@ void LIFTSv2_DRA::step()
     6.378137E+6F - LIFTSv2_DRA_DW.xhat[1];
   v[2] = (LIFTSv2_DRA_U.Gps_Alt - LIFTSv2_DRA_U.Launch_LLA[2]) -
     LIFTSv2_DRA_DW.xhat[2];
-  _mm_storeu_ps(&v[3], _mm_sub_ps(_mm_set_ps(LIFTSv2_DRA_U.Mag_XYZ[1],
-    LIFTSv2_DRA_U.Mag_XYZ[0], LIFTSv2_DRA_U.Bmp_Vspeed, LIFTSv2_DRA_U.Bmp_Alt),
-    _mm_set_ps(dq_idx_1, dq_idx_0, LIFTSv2_DRA_DW.xhat[5], LIFTSv2_DRA_DW.xhat[2])));
+  v[3] = LIFTSv2_DRA_U.Bmp_Alt - LIFTSv2_DRA_DW.xhat[2];
+  v[4] = LIFTSv2_DRA_U.Bmp_Vspeed - LIFTSv2_DRA_DW.xhat[5];
+  v[5] = LIFTSv2_DRA_U.Mag_XYZ[0] - dq_idx_0;
+  v[6] = LIFTSv2_DRA_U.Mag_XYZ[1] - dq_idx_1;
   v[7] = LIFTSv2_DRA_U.Mag_XYZ[2] - dq_idx_2;
   for (jj = 0; jj < 9; jj++) {
     w_mag = 0.0F;
-    for (b_jBcol = 0; b_jBcol < 8; b_jBcol++) {
-      w_mag += X[9 * b_jBcol + jj] * v[b_jBcol];
+    for (jBcol = 0; jBcol < 8; jBcol++) {
+      w_mag += X[9 * jBcol + jj] * v[jBcol];
     }
 
     LIFTSv2_DRA_DW.xhat[jj] += w_mag;
@@ -591,33 +555,25 @@ void LIFTSv2_DRA::step()
   }
 
   for (jj = 0; jj < 9; jj++) {
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
+    for (jBcol = 0; jBcol < 9; jBcol++) {
       w_mag = 0.0F;
       for (jA = 0; jA < 8; jA++) {
-        w_mag += X[9 * jA + jj] * static_cast<real32_T>((&c_a[0])[(b_jBcol << 3)
-          + jA]);
+        w_mag += X[9 * jA + jj] * static_cast<real32_T>((&c_a[0])[(jBcol << 3) +
+          jA]);
       }
 
-      b_k = 9 * b_jBcol + jj;
-      b_a_0[b_k] = static_cast<real32_T>(b_I[b_k]) - w_mag;
-      b_I_0[b_jBcol + 9 * jj] = 0.0F;
+      b_k = 9 * jBcol + jj;
+      b_a[b_k] = static_cast<real32_T>(b_I[b_k]) - w_mag;
+      b_I_0[jBcol + 9 * jj] = 0.0F;
     }
   }
 
   for (jj = 0; jj < 9; jj++) {
-    for (b_jBcol = 0; b_jBcol < 9; b_jBcol++) {
-      w_mag = LIFTSv2_DRA_DW.P[9 * jj + b_jBcol];
-      for (jA = 0; jA <= 4; jA += 4) {
-        tmp_e = _mm_loadu_ps(&b_a_0[9 * b_jBcol + jA]);
-        e_k = 9 * jj + jA;
-        tmp_d = _mm_loadu_ps(&b_I_0[e_k]);
-        _mm_storeu_ps(&b_I_0[e_k], _mm_add_ps(_mm_mul_ps(tmp_e, _mm_set1_ps
-          (w_mag)), tmp_d));
-      }
-
-      for (jA = 8; jA < 9; jA++) {
+    for (jBcol = 0; jBcol < 9; jBcol++) {
+      w_mag = LIFTSv2_DRA_DW.P[9 * jj + jBcol];
+      for (jA = 0; jA < 9; jA++) {
         b_k = 9 * jj + jA;
-        b_I_0[b_k] += b_a_0[9 * b_jBcol + jA] * w_mag;
+        b_I_0[b_k] += b_a[9 * jBcol + jA] * w_mag;
       }
     }
   }

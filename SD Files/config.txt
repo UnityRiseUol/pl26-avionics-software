@@ -11,6 +11,10 @@ burnoutStreakRequired=5
 apogeeStreakRequired=8
 landStreakRequired=10
 landingAltitudeThresholdFt=15.00
+launchLLA0=0.0000000
+launchLLA1=0.0000000
+launchLLA2=0.000
+useConfiguredLaunchLLA=0
 wifiSSID=LIFTSv2
 wifiPassword=123456789
 

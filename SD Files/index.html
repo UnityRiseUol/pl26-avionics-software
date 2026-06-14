@@ -347,6 +347,41 @@
                 </div>
             </div>
 
+            <!-- Launch LLA Settings -->
+            <div class="section">
+                <h3>🛰️ Launch LLA Configuration</h3>
+                <div class="info-box">
+                    Set a fixed launch origin for the DRA, or disable this option to capture the launch LLA from the first valid GPS fix when logging starts.
+                </div>
+                <div class="form-group full">
+                    <label>
+                        <input type="checkbox" id="useConfiguredLaunchLLA" name="useConfiguredLaunchLLA">
+                        Use configured Launch LLA
+                    </label>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="launchLLA0">Launch Latitude (deg):</label>
+                        <div class="setting-description">WGS84 latitude used by the DRA</div>
+                    </div>
+                    <input type="number" id="launchLLA0" name="launchLLA0" step="0.0000001" min="-90" max="90" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="launchLLA1">Launch Longitude (deg):</label>
+                        <div class="setting-description">WGS84 longitude used by the DRA</div>
+                    </div>
+                    <input type="number" id="launchLLA1" name="launchLLA1" step="0.0000001" min="-180" max="180" required>
+                </div>
+                <div class="form-group">
+                    <div>
+                        <label for="launchLLA2">Launch Altitude (m):</label>
+                        <div class="setting-description">Reference altitude used by the DRA</div>
+                    </div>
+                    <input type="number" id="launchLLA2" name="launchLLA2" step="0.001" required>
+                </div>
+            </div>
+
             <div class="button-group">
                 <button type="submit">💾 Save All Settings</button>
                 <button type="button" class="secondary" onclick="reloadSettings()">🔄 Reload Settings</button>
@@ -397,7 +432,8 @@
         try {
             const response = await fetch('/getconfig');
             if (!response.ok) {
-                throw new Error(`HTTP error! Status: ${response.status}`);
+                showStatus(`✗ HTTP error! Status: ${response.status}`, 'error');
+                return;
             }
             const config = await response.json();
 
@@ -432,11 +468,17 @@
         for (let [key, value] of formData.entries()) {
             if (key === 'wifiSSID' || key === 'wifiPassword') {
                 newConfig[key] = value;
-            } else if (key === 'launchThresholdMultiplier' || key === 'burnoutThresholdMultiplier' || key === 'pressure' || key === 'landingAltitudeThresholdFt') {
+            } else if (key === 'useConfiguredLaunchLLA') {
+                newConfig[key] = true;
+            } else if (key === 'launchThresholdMultiplier' || key === 'burnoutThresholdMultiplier' || key === 'pressure' || key === 'landingAltitudeThresholdFt' || key === 'launchLLA0' || key === 'launchLLA1' || key === 'launchLLA2') {
                 newConfig[key] = parseFloat(value);
             } else {
                 newConfig[key] = parseInt(value);
             }
+        }
+
+        if (!document.getElementById('useConfiguredLaunchLLA').checked) {
+            newConfig.useConfiguredLaunchLLA = false;
         }
 
         showStatus('Saving configuration...', 'info');
@@ -452,7 +494,8 @@
 
             const responseText = await response.text();
             if (!response.ok) {
-                throw new Error(responseText);
+                showStatus(`✗ Error: ${responseText}`, 'error');
+                return;
             }
 
             showStatus('✓ Configuration saved successfully!', 'success');
