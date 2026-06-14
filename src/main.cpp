@@ -147,9 +147,10 @@ struct __attribute__((packed)) TelemetryPacket {
   float insX;
   float insY;
   float insZ;
+  int32_t flightPhase;
 };
 
-static_assert(sizeof(TelemetryPacket) == 44, "TelemetryPacket must remain 44 bytes");
+static_assert(sizeof(TelemetryPacket) == 48, "TelemetryPacket must remain 48 bytes");
 
 QueueHandle_t logQueue = nullptr;
 File logFile;
@@ -1124,6 +1125,7 @@ void LoRaTask(void* pvParameters) {
     if (telemetryMutex && xSemaphoreTake(telemetryMutex, portMAX_DELAY) == pdTRUE) {
       packet.altitude = latestSensorSample.bmpAltitude;
       packet.vSpeed = latestSensorSample.bmpVSpeed;
+      packet.flightPhase = static_cast<int32_t>(latestSensorSample.flightPhase);
       xSemaphoreGive(telemetryMutex);
     }
 
